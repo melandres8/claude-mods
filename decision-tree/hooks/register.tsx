@@ -520,7 +520,8 @@ async function present($: EngineInterface, next: DecisionAsk, isAsked: boolean) 
   // main screen it would open inline, so the status line points to it instead.
   const shouldOpen = isAsked || isFullscreen !== false
   const isPlaced = shouldOpen ? (await $.ui.open({ id: PANE, title: TITLE })).isPlaced : false
-  void imply($, next.id, 0, 0)
+  // A dialog the pane could not take goes back to the native one: nothing to analyse.
+  if (!isAsked || isPlaced) void imply($, next.id, 0, 0)
   return isPlaced
 }
 
@@ -543,11 +544,32 @@ async function current($: EngineInterface, id: string) {
   return a !== null && a.id === id ? a : null
 }
 
+// Slots whose analysis or fork is being started: a second press of the same
+// option waits for nothing and starts nothing.
+const implying = new Set<string>()
+const branching = new Set<string>()
+
+const reasonOf = (error: unknown) => (error instanceof Error ? error.message : String(error))
+
+/** Analyses an option once; a failure is shown as such, never left loading. */
 async function imply($: EngineInterface, id: string, qi: number, oi: number) {
+  const slot = slotOf(id, qi, oi)
+  if (implying.has(slot)) return
+  implying.add(slot)
+  try {
+    await analyse($, id, qi, oi, slot)
+  } catch (error) {
+    const failed: DecisionImplication = { status: 'error', text: `No se pudo analizar (${reasonOf(error)}).` }
+    await update($, implications, all => ({ ...all, [slot]: failed })).catch(() => undefined)
+  } finally {
+    implying.delete(slot)
+  }
+}
+
+async function analyse($: EngineInterface, id: string, qi: number, oi: number, slot: string) {
   const a = await current($, id)
   const q = a?.questions[qi]
   const option = q?.options[oi]
-  const slot = slotOf(id, qi, oi)
   if (a === null || q === undefined || option === undefined) return
   if ((await read($, implications))[slot] !== undefined) return
 
@@ -589,11 +611,22 @@ async function isOwnFork($: EngineInterface, agentId: string): Promise<boolean> 
   return pendingSpawns > 0
 }
 
+/** Starts one fork for an option; a second press while it starts does nothing. */
 async function branch($: EngineInterface, id: string, qi: number, oi: number) {
+  const slot = slotOf(id, qi, oi)
+  if (branching.has(slot)) return
+  branching.add(slot)
+  try {
+    await startFork($, id, qi, oi, slot)
+  } finally {
+    branching.delete(slot)
+  }
+}
+
+async function startFork($: EngineInterface, id: string, qi: number, oi: number, slot: string) {
   const a = await current($, id)
   const q = a?.questions[qi]
   const option = q?.options[oi]
-  const slot = slotOf(id, qi, oi)
   if (a === null || q === undefined || option === undefined) return
   const existing = (await read($, forks))[slot]
   if (existing !== undefined && existing.status !== 'error') return

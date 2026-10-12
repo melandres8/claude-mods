@@ -24,6 +24,12 @@ function world(on: On) {
     isListFailing: false,
     /** Holds a spawn until it resolves, as a slow start does. */
     spawnGate: Promise.resolve(),
+    /** `$.model.fork` calls, the analysis of an option. */
+    forkCalls: 0,
+    forkGate: Promise.resolve(),
+    isForkFailing: false,
+    /** Whether `$.ui.open` places the pane. */
+    isPlaced: true,
   }
   on('agent.list', () => {
     if (seen.isListFailing) throw new Error('agent.list failed')
@@ -35,10 +41,15 @@ function world(on: On) {
     seen.completes += 1
     return { value: { isAnswered: true, text: JSON.stringify(QUESTION), usage: usage() } } as never
   })
-  on('model.fork', () => ({ value: { isAnswered: true, text: '**Qué harías después**: migrar.', usage: usage() } }) as never)
+  on('model.fork', async () => {
+    seen.forkCalls += 1
+    await seen.forkGate
+    if (seen.isForkFailing) throw new Error('model.fork failed')
+    return { value: { isAnswered: true, text: '**Qué harías después**: migrar.', usage: usage() } } as never
+  })
   on('ui.open', () => {
     seen.opened += 1
-    return { value: { isPlaced: true } } as never
+    return { value: { isPlaced: seen.isPlaced } } as never
   })
   on('agent.spawn', async (_$, e) => {
     seen.spawns.push(e.prompt)
@@ -497,4 +508,71 @@ test('the handed-off dialog draws as a card, and the panel draws on each surface
     expect(await pane.find({ key: 'send' })).toBeDefined()
     await pane.unmount()
   }
+})
+
+// Waits for a condition read asynchronously, as a drawing's elements are.
+async function until(ready: () => Promise<boolean>) {
+  for (let i = 0; i < 500; i += 1) {
+    if (await ready()) return
+    await new Promise(resolve => setTimeout(resolve, 2))
+  }
+  throw new Error('never happened')
+}
+
+const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+
+function gate() {
+  let release = () => {}
+  const held = new Promise<void>(resolve => {
+    release = resolve
+  })
+  return { held, release }
+}
+
+test('an analysis that fails says so instead of loading forever', async ($, on) => {
+  const seen = world(on)
+  seen.isForkFailing = true
+  await complete($, '¿Lo hago con Postgres o con SQLite?')
+  await settle($, () => seen.forkCalls > 0)
+
+  const ui = await $.ui.mount({ plugin: 'decision-tree', surface: 'terminal', ...PANE })
+  await until(async () => (await ui.find({ type: 'Markdown', key: 'implication' })) !== undefined)
+  expect((await ui.find({ type: 'Markdown', key: 'implication' }))?.text).toContain('No se pudo analizar')
+  expect(await ui.find({ type: 'Text', text: /Analizando/ })).toBe(undefined)
+  await ui.unmount()
+})
+
+test('a double press starts one analysis and one fork', async ($, on) => {
+  const seen = world(on)
+  const analysis = gate()
+  seen.forkGate = analysis.held
+  await complete($, '¿Lo hago con Postgres o con SQLite?')
+  await settle($, () => seen.forkCalls === 1)
+
+  const ui = await $.ui.mount({ plugin: 'decision-tree', surface: 'terminal', ...PANE })
+  const choosing = Promise.all([ui.press({ key: 'opt-1' }), ui.press({ key: 'opt-1' })])
+  await settle($, () => seen.forkCalls >= 2)
+  await pause(20)
+  expect(seen.forkCalls).toBe(2)
+  analysis.release()
+  await choosing
+
+  const start = gate()
+  seen.spawnGate = start.held
+  const trying = Promise.all([ui.press({ key: 'try' }), ui.press({ key: 'try' })])
+  await settle($, () => seen.spawns.length >= 1)
+  await pause(20)
+  expect(seen.spawns.length).toBe(1)
+  start.release()
+  await trying
+  await ui.unmount()
+})
+
+test('a dialog the pane cannot take keeps the native dialog and analyses nothing', async ($, on) => {
+  const seen = world(on)
+  seen.isPlaced = false
+  const asked = await $.tool.call({ tool: 'AskUserQuestion', tool_use_id: 'ask-9', questions: ASKED } as never)
+  expect('deny' in asked && asked.deny !== undefined).toBe(false)
+  await pause(20)
+  expect(seen.forkCalls).toBe(0)
 })
