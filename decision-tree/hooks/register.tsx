@@ -145,8 +145,16 @@ const SHELL_SPECS: Record<string, ShellSpec | 'any'> = {
   },
   cat: { short: 'AbeEnstTuv', long: ['--number', '--number-nonblank', '--show-all', '--squeeze-blank'] },
   head: { short: 'qv', shortValue: 'nc', count: true, long: ['--quiet', '--silent', '--verbose'], longValue: ['--lines', '--bytes'] },
-  // No -f, -F, --follow or --retry: a fork that follows a file never ends.
-  tail: { short: 'qrv', shortValue: 'nc', count: true, long: ['--quiet', '--silent', '--verbose'], longValue: ['--lines', '--bytes'] },
+  // No -f, -F, --follow or --retry: a fork that follows a file never ends. No
+  // operand starting with +: the traditional form `tail +5f` follows too.
+  tail: {
+    short: 'qrv',
+    shortValue: 'nc',
+    count: true,
+    long: ['--quiet', '--silent', '--verbose'],
+    longValue: ['--lines', '--bytes'],
+    operand: word => !word.startsWith('+'),
+  },
   grep: {
     short: 'rRnilLcvwxoqsHhEFGIPabU',
     shortValue: 'efmABCdD',
