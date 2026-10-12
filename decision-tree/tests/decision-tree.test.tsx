@@ -275,6 +275,9 @@ test('what a fork may call', () => {
   expect(forkMayCall('Agent', {})).toBe(false)
   expect(forkMayCall('AskUserQuestion', {})).toBe(false)
   expect(forkMayCall('mcp__github__create_issue', {})).toBe(false)
+  // A fork may read secrets (.env); a URL would carry them out.
+  expect(forkMayCall('WebFetch', {})).toBe(false)
+  expect(forkMayCall('WebSearch', {})).toBe(false)
 })
 
 test('a custom answer joins the options and gets analysed', async ($, on) => {

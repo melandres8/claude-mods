@@ -25,9 +25,10 @@ const forkIds = atom({ plugin: 'decision-tree', key: 'forkIds' } as const, [])
 // What the last drawing said about the layout; unknown until the pane draws.
 let isFullscreen: boolean | undefined
 
-// What a fork may call: reading and looking things up, nothing that changes
-// the workspace. Bash is judged per command by isReadOnlyShell.
-const FORK_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LSP', 'WebFetch', 'WebSearch', 'ToolSearch'])
+// What a fork may call: reading the workspace, nothing that changes it.
+// Bash is judged per command by isReadOnlyShell. No WebFetch or WebSearch: a
+// fork may read secrets (.env), and a URL or a query would carry them out.
+const FORK_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LSP', 'ToolSearch'])
 
 // The shell guard reads a command the way the shell will, then judges each
 // simple command against an allowlist of binaries and, per binary, of flags.
