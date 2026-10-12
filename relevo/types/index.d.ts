@@ -9,6 +9,10 @@ export type RelevoTurn = 'self' | 'peer' | null
 // The one-step link: none asked, sent and waiting for the ack, or acked.
 export type RelevoLink = 'none' | 'waiting' | 'linked'
 
+// A link another session's relevo asked for, held until the person accepts:
+// the role the asker takes, its session id and the nonce it chose.
+export type RelevoInvite = { from: RelevoRole; id: string; nonce: string }
+
 declare module 'claude-code' {
   interface PluginState {
     relevo: {
@@ -27,6 +31,12 @@ declare module 'claude-code' {
       turn: RelevoTurn
       link: RelevoLink
       lastError: string | null
+      // The link's shared secret: the asker makes it, the ack echoes it.
+      nonce: string | null
+      invite: RelevoInvite | null
+      // A round the peer sent while paused or done, as the model will read it;
+      // /relevo resume hands it to the model.
+      inbox: string | null
       draftRole: RelevoRole
       draftPeer: string | null
       draftGoal: string
