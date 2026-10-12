@@ -1,6 +1,6 @@
 {
   "name": "relevo",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Relay between two local sessions: one plans, the other builds, and they hand work back and forth on their own.",
   "author": {
     "name": "Melkin Mosquera"
