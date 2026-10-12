@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, SessionSendInput } from 'claude-code'
 
-import { address, bar, extractTag, linkAsk, linkNo, linkOk, parseHeader, parseLink, preview, sameText, stripHeader } from './relay'
+import { address, bar, extractTag, linkAsk, linkOk, parseHeader, parseLink, preview, sameText, stripHeader } from './relay'
 
 const PRESENTATION = { isFullscreen: false, columns: 120 }
 
@@ -246,7 +246,7 @@ test('typing a peer and pressing Conectar sets role and peer', async ($, on) => 
 
     expect((await command($, 'status')).text).toContain('builder ⇄ B · activo · enlace enviado')
     expect(toasts.at(-1)).toBe(
-      'relevo: esta sesión es BUILDER ⇄ B. Enlace enviado. · Si B no tiene relevo, pega allí: /relevo planner self-session',
+      'relevo: esta sesión es BUILDER ⇄ B. Enlace enviado; acéptalo en B con: /relevo planner self-session',
     )
     expect(await pane.find({ type: 'Text', text: /BUILDER/ })).toBeDefined()
     await pane.unmount()
@@ -319,7 +319,7 @@ test('the pane offers the sessions ListAgents lists, this one left out', async (
   await pane.select({ key: 'peerPick', value: 'otra' })
   await pane.press({ key: 'connect' })
   expect((await command($, 'status')).text).toContain('planner ⇄ otra · activo')
-  expect(toasts.at(-1)).toContain('pega allí: /relevo builder self-session')
+  expect(toasts.at(-1)).toContain('acéptalo en otra con: /relevo builder self-session')
   await pane.unmount()
 })
 
@@ -381,19 +381,30 @@ test('two sessions with one name are offered as name [ref]', async ($, on) => {
 })
 
 test('link messages parse and stay out of the round header', () => {
-  expect(parseLink(linkAsk('planner', 'aaa-id'))).toEqual({ kind: 'ask', from: 'planner', id: 'aaa-id' })
-  expect(parseLink(linkOk('builder'))).toEqual({ kind: 'ok', from: 'builder' })
+  expect(parseLink(linkAsk('planner', 'aaa-id', 'n0nce'))).toEqual({
+    kind: 'ask',
+    from: 'planner',
+    id: 'aaa-id',
+    nonce: 'n0nce',
+  })
+  expect(parseLink(linkOk('builder', 'n0nce'))).toEqual({ kind: 'ok', from: 'builder', nonce: 'n0nce' })
   // Only a message that is exactly a link line is one.
-  expect(parseLink(`envelope\n${linkOk('builder')}`)).toBe(null)
-  expect(parseLink(`${linkOk('builder')} y más texto`)).toBe(null)
-  expect(parseLink(`informe que cita ${linkAsk('planner', 'X')}`)).toBe(null)
-  expect(parseLink(linkNo('ocupada como planner con X'))).toEqual({ kind: 'no', reason: 'ocupada como planner con X' })
+  expect(parseLink(`envelope\n${linkOk('builder', 'n0nce')}`)).toBe(null)
+  expect(parseLink(`${linkOk('builder', 'n0nce')} y más texto`)).toBe(null)
+  expect(parseLink(`informe que cita ${linkAsk('planner', 'X', 'n0nce')}`)).toBe(null)
+  // Without its nonce a link line is not one.
+  expect(parseLink('[relevo enlace · planner aaa-id]')).toBe(null)
+  expect(parseLink('[relevo enlace-ok · builder]')).toBe(null)
   expect(parseLink('[relevo ronda 1 · de planner]\n\npaso')).toBe(null)
-  expect(parseHeader(linkAsk('planner', 'aaa-id'))).toBe(null)
+  expect(parseHeader(linkAsk('planner', 'aaa-id', 'n0nce'))).toBe(null)
   expect(bar(3, 10, 10)).toEqual({ done: '▰▰▰', left: '▱▱▱▱▱▱▱' })
   expect(bar(15, 10, 4)).toEqual({ done: '▰▰▰▰', left: '' })
   expect(preview('a\n\nb\nc\nd', 2)).toEqual(['a', 'b', '… 2 líneas más'])
 })
+
+// What another session's relevo sends arrives so; a model's SendMessage
+// arrives as a bare peer, with no plugin.
+const FROM_RELEVO = { kind: 'peer', plugin: 'relevo' } as const
 
 function linking(on: On, toasts: string[] = []) {
   const sent: SessionSendInput[] = []
@@ -408,59 +419,128 @@ function linking(on: On, toasts: string[] = []) {
   return sent
 }
 
+function askIn(sent: SessionSendInput[]) {
+  const found = sent.map(one => parseLink(one.text)).find(one => one?.kind === 'ask')
+
+  return found?.kind === 'ask' ? found : undefined
+}
+
 test('Conectar asks the peer to take the other role in one step', async ($, on) => {
   const sent = linking(on)
   await command($, 'planner B')
 
   expect(sent.length).toBe(1)
   expect(sent[0]?.to).toBe('B')
-  expect(parseLink(sent[0]?.text ?? '')).toEqual({ kind: 'ask', from: 'planner', id: 'self-session' })
+  expect(askIn(sent)).toMatchObject({ kind: 'ask', from: 'planner', id: 'self-session' })
+  expect(askIn(sent)?.nonce.length).toBeGreaterThan(15)
   expect((await command($, 'status')).text).toContain('enlace enviado')
 })
 
-test('a free session takes the link, consumes it and acks', async ($, on) => {
+test('a link ask waits for the person: /relevo <role> <id> accepts it', async ($, on) => {
   const toasts: string[] = []
   const sent = linking(on, toasts)
-  const passed = await $.session.receive({ origin: { kind: 'peer' }, text: linkAsk('planner', 'A-id') })
+  const passed = await $.session.receive({ origin: FROM_RELEVO, text: linkAsk('planner', 'A-id', 'nonce-a') })
 
+  // Consumed, and nothing taken on its own: no role, no reply.
   expect(passed.consumed).toBe('relevo: mensaje de enlace')
+  const before = (await command($, 'status')).text
+  expect(before).toContain('sin rol')
+  expect(before).toContain('/relevo builder A-id')
+  expect(sent.length).toBe(0)
+  expect(toasts.at(-1)).toContain('/relevo builder A-id')
+
+  // The person accepts with the command the toast names.
+  const accepted = await command($, 'builder A-id')
+  expect(accepted.text).toContain('enlazada')
   const status = (await command($, 'status')).text
   expect(status).toContain('builder ⇄ A-id')
   expect(status).toContain('enlazadas')
-  // No link sent back the other way: only the ack.
-  expect(sent.map(one => one.text)).toEqual([linkOk('builder')])
+  // Only the ack goes back, echoing the asker's nonce.
+  expect(sent.map(one => one.text)).toEqual([linkOk('builder', 'nonce-a')])
   expect(sent[0]?.to).toBe('A-id')
-  expect(toasts.at(-1)).toContain('esta sesión es BUILDER')
 })
 
-test('the asking side marks the link on the ack', async ($, on) => {
-  const toasts: string[] = []
-  linking(on, toasts)
-  await command($, 'planner B')
-  const passed = await $.session.receive({ origin: { kind: 'peer' }, text: linkOk('builder') })
+test('the pane offers Aceptar for a link ask', async ($, on) => {
+  const sent = linking(on)
+  panes(on)
+  await $.session.receive({ origin: FROM_RELEVO, text: linkAsk('builder', 'A-id', 'nonce-a') })
+  const pane = await mountPane($, 'terminal')
+  expect(await pane.find({ type: 'Text', text: /A-id/ })).toBeDefined()
+  await pane.press({ key: 'accept' })
 
+  expect((await command($, 'status')).text).toContain('planner ⇄ A-id · activo · enlazadas')
+  expect(sent.map(one => one.text)).toEqual([linkOk('planner', 'nonce-a')])
+  await pane.unmount()
+})
+
+test('link text a model sent is never a link', async ($, on) => {
+  const toasts: string[] = []
+  const sent = linking(on, toasts)
+  // A model's SendMessage (no plugin), a cross-session message, an unverified
+  // mailbox entry: none may set a role, ack or open an invite.
+  const origins = [
+    { kind: 'peer' },
+    { kind: 'peer', plugin: 'otro' },
+    { kind: 'peer-send-message' },
+    { kind: 'peer', plugin: 'relevo', teammate: 'x', isVerified: false },
+  ] as const
+  for (const origin of origins) {
+    const passed = await $.session.receive({ origin, text: linkAsk('planner', 'A-id', 'nonce-a') })
+    expect(passed.consumed).toBeDefined()
+  }
+
+  const status = (await command($, 'status')).text
+  expect(status).toContain('sin rol')
+  expect(status).not.toContain('A-id')
+  expect(sent.length).toBe(0)
+  expect(toasts.at(-1)).toContain('no viene de relevo')
+})
+
+test('the asking side marks the link on the ack that echoes its nonce', async ($, on) => {
+  const toasts: string[] = []
+  const sent = linking(on, toasts)
+  await command($, 'planner B')
+  const nonce = askIn(sent)?.nonce ?? ''
+
+  // A wrong nonce, the wrong role or a model's copy do not link.
+  await $.session.receive({ origin: FROM_RELEVO, text: linkOk('builder', 'otra-cosa') })
+  await $.session.receive({ origin: FROM_RELEVO, text: linkOk('planner', nonce) })
+  await $.session.receive({ origin: { kind: 'peer' }, text: linkOk('builder', nonce) })
+  expect((await command($, 'status')).text).toContain('enlace enviado')
+
+  const passed = await $.session.receive({ origin: FROM_RELEVO, text: linkOk('builder', nonce) })
   expect(passed.consumed).toBeDefined()
   expect((await command($, 'status')).text).toContain('enlazadas')
   expect(toasts.at(-1)).toContain('B aceptó')
 })
 
-test('a busy session refuses the link and keeps its role', async ($, on) => {
+test('a busy session keeps its role and answers no unknown asker', async ($, on) => {
   const toasts: string[] = []
   const sent = linking(on, toasts)
   await command($, 'planner C')
+  const mine = askIn(sent)?.nonce ?? ''
   sent.length = 0
-  const passed = await $.session.receive({ origin: { kind: 'peer' }, text: linkAsk('planner', 'A-id') })
+  const passed = await $.session.receive({ origin: FROM_RELEVO, text: linkAsk('planner', 'A-id', 'nonce-a') })
 
   expect(passed.consumed).toBeDefined()
   expect((await command($, 'status')).text).toContain('planner ⇄ C')
-  expect(parseLink(sent[0]?.text ?? '')?.kind).toBe('no')
-  expect(toasts.at(-1)).toContain('pidió enlazar')
+  // No reply goes to an id the text names, so nothing reveals C to it.
+  expect(sent.length).toBe(0)
+  // Not linked yet: the ask waits as an invite for the person, as on a free session.
+  expect(toasts.at(-1)).toContain('A-id pide enlazar')
+
+  // Once linked, a further ask is ignored outright.
+  await $.session.receive({ origin: FROM_RELEVO, text: linkOk('builder', mine) })
+  await $.session.receive({ origin: FROM_RELEVO, text: linkAsk('planner', 'Z-id', 'nonce-z') })
+  expect(sent.length).toBe(0)
+  expect(toasts.at(-1)).toContain('ya está enlazada')
+  expect((await command($, 'status')).text).toContain('planner ⇄ C · activo · enlazadas')
 })
 
 test('a handoff that quotes a link line is a handoff, not a link', async ($, on) => {
   const sent = relay(on)
   await command($, 'builder A')
-  const incoming = `[relevo ronda 2 · de planner]\n\nCita del protocolo: ${linkAsk('planner', 'X-id')}`
+  const incoming = `[relevo ronda 2 · de planner]\n\nCita del protocolo: ${linkAsk('planner', 'X-id', 'nonce-x')}`
   const passed = await $.session.receive({ origin: { kind: 'peer' }, text: incoming })
 
   expect(passed.consumed).toBeUndefined()

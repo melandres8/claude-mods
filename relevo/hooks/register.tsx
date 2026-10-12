@@ -1,5 +1,12 @@
 import { atom, read, update } from 'claude-code'
-import type { Color, ElementConstructor, EngineInterface, Register, TextProps } from 'claude-code'
+import type {
+  Color,
+  ElementConstructor,
+  EngineInterface,
+  Register,
+  SessionReceiveOrigin,
+  TextProps,
+} from 'claude-code'
 
 import type { RelevoLink, RelevoPeer, RelevoRole, RelevoTurn } from '../types'
 import {
@@ -9,8 +16,8 @@ import {
   extractTag,
   header,
   linkAsk,
-  linkNo,
   linkOk,
+  looksLikeLink,
   parseHeader,
   parseLink,
   preview,
@@ -33,6 +40,8 @@ const goal = atom({ plugin: 'relevo', key: 'goal' } as const, null)
 const turn = atom({ plugin: 'relevo', key: 'turn' } as const, null)
 const link = atom({ plugin: 'relevo', key: 'link' } as const, 'none')
 const lastError = atom({ plugin: 'relevo', key: 'lastError' } as const, null)
+const nonce = atom({ plugin: 'relevo', key: 'nonce' } as const, null)
+const invite = atom({ plugin: 'relevo', key: 'invite' } as const, null)
 // What the pane's fields hold until the person presses a button.
 const draftRole = atom({ plugin: 'relevo', key: 'draftRole' } as const, 'planner')
 const draftPeer = atom({ plugin: 'relevo', key: 'draftPeer' } as const, null)
@@ -308,31 +317,44 @@ async function sendQuiet($: $, to: string, text: string): Promise<boolean> {
 // One function per /relevo verb, each returning the text the command shows.
 // The command parses its arguments and calls these; a pane can call them too.
 
-// Sets the role. With announce, it also asks the peer to take the other role
-// in one step; the manual line stays in the answer until the peer acks.
-async function setRole($: $, verb: RelevoRole, to: string, announce = true): Promise<string> {
+// Sets the role: the person's own act, the only one that binds a peer or
+// sets the link's nonce. When the peer already asked for this pairing, it
+// accepts that ask and acks with its nonce; otherwise it asks the peer with
+// a fresh nonce, and the peer's person accepts there.
+async function setRole($: $, verb: RelevoRole, to: string): Promise<string> {
   const self = await $.session.id()
-  if (to.trim() === self) {
+  const target = to.trim()
+  if (target === self) {
     return 'el peer no puede ser esta misma sesión.'
   }
+  const asked = await read($, invite)
+  const accepting = asked !== null && asked.id === target && other(asked.from) === verb ? asked : null
   await update($, role, () => verb)
-  await update($, peer, () => to)
+  await update($, peer, () => target)
   await reset($)
   await update($, goal, () => null)
   await update($, lastReceived, () => null)
   await update($, lastReceivedAt, () => null)
-  await update($, link, () => 'none')
+  await update($, invite, () => null)
   await showStatus($)
-  const manual = `/relevo ${other(verb)} ${self}`
-  if (!announce) {
-    return `esta sesión es ${verb.toUpperCase()} ⇄ ${to}.`
-  }
-  const asked = await sendQuiet($, to, linkAsk(verb, self))
-  await update($, link, () => (asked ? 'waiting' : 'none'))
 
-  return asked
-    ? `esta sesión es ${verb.toUpperCase()} ⇄ ${to}. Enlace enviado.\nSi ${to} no tiene relevo, pega allí: ${manual}`
-    : `esta sesión es ${verb.toUpperCase()} ⇄ ${to}.\nEn la otra sesión: ${manual}`
+  if (accepting !== null) {
+    await update($, nonce, () => accepting.nonce)
+    await update($, link, () => 'linked')
+    await sendQuiet($, target, linkOk(verb, accepting.nonce))
+
+    return `enlazada con ${target}; esta sesión es ${verb.toUpperCase()}.`
+  }
+
+  const fresh = crypto.randomUUID()
+  await update($, nonce, () => fresh)
+  const manual = `/relevo ${other(verb)} ${self}`
+  const sent = await sendQuiet($, target, linkAsk(verb, self, fresh))
+  await update($, link, () => (sent ? 'waiting' : 'none'))
+
+  return sent
+    ? `esta sesión es ${verb.toUpperCase()} ⇄ ${target}. Enlace enviado; acéptalo en ${target} con: ${manual}`
+    : `esta sesión es ${verb.toUpperCase()} ⇄ ${target}. No se pudo enviar el enlace.\nEn la otra sesión: ${manual}`
 }
 
 async function startGoal($: $, maxRounds: number, text: string): Promise<string> {
@@ -387,15 +409,27 @@ async function turnOff($: $): Promise<string> {
   await update($, turn, () => null)
   await update($, link, () => 'none')
   await update($, lastError, () => null)
+  await update($, nonce, () => null)
+  await update($, invite, () => null)
   $.ui.status(undefined)
 
   return 'rol quitado; no se envía nada más.'
 }
 
+// The pending link ask as one line, with the command that accepts it.
+async function inviteLine($: $): Promise<string | null> {
+  const asked = await read($, invite)
+
+  return asked === null
+    ? null
+    : `${asked.id} pide enlazar como ${asked.from}. Si es tu otra sesión, acepta con: /relevo ${other(asked.from)} ${asked.id}`
+}
+
 async function statusText($: $, maxRounds: number): Promise<string> {
   const current = await read($, role)
+  const asked = await inviteLine($)
   if (current === null) {
-    return `sin rol. Esta sesión: ${await $.session.id()}\n\n${USAGE}`
+    return [`sin rol. Esta sesión: ${await $.session.id()}`, ...(asked === null ? [] : [asked]), '', USAGE].join('\n')
   }
   const at = await read($, lastHandoffAt)
   const sent = await read($, lastSent)
@@ -409,51 +443,64 @@ async function statusText($: $, maxRounds: number): Promise<string> {
     `${current} ⇄ ${await read($, peer)} · ${state} · ${linked}`,
     `ronda ${await read($, round)}/${await limitOf($, maxRounds)} · último envío ${when}`,
     sent === null ? 'último mensaje: (ninguno)' : `último mensaje:\n${sent}`,
+    ...(asked === null ? [] : [asked]),
   ].join('\n')
 }
 
-// The link messages relevo exchanges itself, never shown to the model.
-async function answerLink($: $, text: string): Promise<boolean> {
-  const message = parseLink(text)
-  if (message === null) {
+// Whether a delivery was composed by another session's relevo: a peer's,
+// named relevo, and not an unverified mailbox entry. The name is the sender
+// engine's claim; a model's own SendMessage never carries it, so this keeps
+// model-written text out. It is not proof of who sent it: the nonce and the
+// person's confirmation are.
+function fromRelevo(origin: SessionReceiveOrigin): boolean {
+  if (origin.kind !== 'peer' || !('plugin' in origin) || origin.plugin !== 'relevo') {
     return false
   }
+
+  return !('isVerified' in origin) || origin.isVerified
+}
+
+const LONG_TOAST = { timeoutMs: 15000 }
+
+// The link messages relevo exchanges itself, never shown to the model. An ask
+// is held as an invite for the person to accept; nothing is ever answered to
+// an id a message names, so an asker learns nothing from this session. An ok
+// links only when it echoes the nonce this session sent, from the other role.
+async function answerLink($: $, text: string): Promise<void> {
+  const message = parseLink(text)
+  if (message === null) {
+    $.ui.toast('relevo: descartado un mensaje de enlace mal formado.')
+
+    return
+  }
   const current = await read($, role)
-  const to = await read($, peer)
 
   if (message.kind === 'ask') {
-    const self = await $.session.id()
-    if (message.id === self) {
-      return true
+    if (message.id === (await $.session.id())) {
+      return
     }
-    const mine = other(message.from)
-    if (current === null || (current === mine && to === message.id)) {
-      if (current === null) {
-        await setRole($, mine, message.id, false)
-      }
-      await update($, link, () => 'linked')
-      await sendQuiet($, message.id, linkOk(mine))
-      $.ui.toast(`relevo: enlazada con ${short(message.id)}; esta sesión es ${mine.toUpperCase()}.`)
-    } else {
-      const busy = `ocupada como ${current} con ${short(to)}`
-      await sendQuiet($, message.id, linkNo(busy))
-      $.ui.toast(`relevo: ${short(message.id)} pidió enlazar, pero esta sesión está ${busy}.`)
+    if (current !== null && (await read($, link)) === 'linked') {
+      $.ui.toast(`relevo: ${short(message.id)} pidió enlazar, pero esta sesión ya está enlazada; ignorado.`)
+
+      return
     }
+    await update($, invite, () => ({ from: message.from, id: message.id, nonce: message.nonce }))
+    $.ui.toast(`relevo: ${(await inviteLine($)) ?? ''}`, LONG_TOAST)
 
-    return true
+    return
   }
-  if (current === null) {
-    return true
+  const expected = await read($, nonce)
+  if (
+    current === null ||
+    message.from !== other(current) ||
+    expected === null ||
+    message.nonce !== expected ||
+    (await read($, link)) !== 'waiting'
+  ) {
+    return
   }
-  if (message.kind === 'ok') {
-    await update($, link, () => 'linked')
-    $.ui.toast(`relevo: ${short(to)} aceptó; sesiones enlazadas.`)
-  } else {
-    await update($, link, () => 'none')
-    $.ui.toast(`relevo: ${short(to)} no aceptó el enlace (${message.reason}).`)
-  }
-
-  return true
+  await update($, link, () => 'linked')
+  $.ui.toast(`relevo: ${short(await read($, peer))} aceptó; sesiones enlazadas.`)
 }
 
 export const register: Register = (on, options) => {
@@ -509,7 +556,14 @@ export const register: Register = (on, options) => {
   })
 
   on('session.receive', { origin: { kind: /^peer/ } }, async ($, e, next) => {
-    if (await answerLink($, e.text)) {
+    if (looksLikeLink(e.text)) {
+      if (!fromRelevo(e.origin)) {
+        $.ui.toast('relevo: descartado un mensaje de enlace que no viene de relevo.')
+
+        return { consumed: 'relevo: enlace que no viene de relevo' }
+      }
+      await answerLink($, e.text)
+
       return { consumed: 'relevo: mensaje de enlace' }
     }
     const relayed = parseHeader(e.text)
@@ -526,7 +580,10 @@ export const register: Register = (on, options) => {
     // Only ever passed on: the model reads it as a new turn. Nothing is sent
     // from here, so a peer's message never goes back out without a turn.
     return next(e)
-  }).catch(($, e, next) => next(e))
+  }).catch(($, e, next) =>
+    // Fails closed: a relevo message whose checks threw never reaches the model.
+    looksLikeLink(e.text) ? { consumed: 'relevo: error al leer un mensaje de enlace' } : next(e),
+  )
 
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
@@ -650,7 +707,7 @@ export const register: Register = (on, options) => {
         })()}
         {live?.link === 'waiting' ? (
           <Text color="warning" wrap="wrap">
-            esperando que {short(live.to)} acepte. Si no tiene relevo, pega allí: /relevo {other(live.current)} {self}
+            esperando que {short(live.to)} acepte. Allí: Aceptar en su panel, o /relevo {other(live.current)} {self}
           </Text>
         ) : null}
         {await (async () => {
@@ -660,6 +717,26 @@ export const register: Register = (on, options) => {
             <Text color="error" wrap="truncate-end">
               ✗ {failed}
             </Text>
+          )
+        })()}
+        {await (async () => {
+          const asked = await read($, invite)
+
+          return asked === null ? null : (
+            <Box flexDirection="row" gap={1}>
+              <Box flexGrow={1}>
+                <Text color="warning" wrap="wrap">
+                  ⚑ {asked.id} pide enlazar como {asked.from}; esta sesión sería {other(asked.from)}. Acepta solo si
+                  es tu otra sesión.
+                </Text>
+              </Box>
+              <Button
+                key="accept"
+                label="Aceptar"
+                variant="primary"
+                onPress={() => void setRole($, other(asked.from), asked.id).then(toast)}
+              />
+            </Box>
           )
         })()}
       </Box>
@@ -748,7 +825,7 @@ export const register: Register = (on, options) => {
             </Text>
             <Button key="connect" label="Conectar" variant="primary" onPress={() => void connect()} />
             <Text dimColor wrap="truncate-end">
-              la otra sesión toma sola el rol opuesto
+              la otra sesión confirma el enlace
             </Text>
           </Box>
           {controls}

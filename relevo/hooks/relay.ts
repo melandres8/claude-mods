@@ -78,47 +78,40 @@ export function ago(ms: number): string {
   return minutes < 60 ? `${minutes}m` : `${Math.round(minutes / 60)}h`
 }
 
-// The one-step link. A asks B to take the other role, naming its own session
-// id; B answers ok or no. None matches HEADER, so parseHeader never reads one.
+// The link. A asks B to take the other role, naming its own session id and a
+// nonce of its making; B's person accepts, and B acks echoing the nonce.
+// None matches HEADER, so parseHeader never reads one.
 export type LinkMessage =
-  | { kind: 'ask'; from: RelevoRole; id: string }
-  | { kind: 'ok'; from: RelevoRole }
-  | { kind: 'no'; reason: string }
+  | { kind: 'ask'; from: RelevoRole; id: string; nonce: string }
+  | { kind: 'ok'; from: RelevoRole; nonce: string }
 
 // Anchored at both ends: a message is a link message only when its whole
 // text is one link line, so a handoff that quotes one stays a handoff.
-const LINK = /^\s*\[relevo enlace(?:-(ok|no))? · ([^\]\n]+)\]\s*$/
+const LINK_ASK = /^\s*\[relevo enlace · (planner|builder) (\S+) ([\w-]+)\]\s*$/
+const LINK_OK = /^\s*\[relevo enlace-ok · (planner|builder) ([\w-]+)\]\s*$/
 
-export function linkAsk(from: RelevoRole, id: string): string {
-  return `[relevo enlace · ${from} ${id}]`
+export function linkAsk(from: RelevoRole, id: string, nonce: string): string {
+  return `[relevo enlace · ${from} ${id} ${nonce}]`
 }
 
-export function linkOk(from: RelevoRole): string {
-  return `[relevo enlace-ok · ${from}]`
-}
-
-export function linkNo(reason: string): string {
-  return `[relevo enlace-no · ${reason.replace(/[\]\n]/g, ' ')}]`
+export function linkOk(from: RelevoRole, nonce: string): string {
+  return `[relevo enlace-ok · ${from} ${nonce}]`
 }
 
 export function parseLink(text: string): LinkMessage | null {
-  const match = LINK.exec(text)
-  if (match === null) {
-    return null
+  const ask = LINK_ASK.exec(text)
+  if (ask !== null) {
+    return { kind: 'ask', from: ask[1] as RelevoRole, id: ask[2] ?? '', nonce: ask[3] ?? '' }
   }
-  const [, verdict, rest = ''] = match
-  if (verdict === 'no') {
-    return { kind: 'no', reason: rest.trim() }
-  }
-  const [from, id] = rest.trim().split(/\s+/)
-  if (from !== 'planner' && from !== 'builder') {
-    return null
-  }
-  if (verdict === 'ok') {
-    return { kind: 'ok', from }
-  }
+  const ok = LINK_OK.exec(text)
 
-  return id === undefined ? null : { kind: 'ask', from, id }
+  return ok === null ? null : { kind: 'ok', from: ok[1] as RelevoRole, nonce: ok[2] ?? '' }
+}
+
+// Text that starts as a link message does, well formed or not: what a
+// session must not take from anyone but another session's relevo.
+export function looksLikeLink(text: string): boolean {
+  return /^\s*\[relevo enlace/.test(text)
 }
 
 // Rounds as a row of cells, `width` wide: filled up to n of limit.
