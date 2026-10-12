@@ -116,9 +116,18 @@ async function deliver($: $, maxRounds: number, written: string): Promise<string
   if (current === null || to === null || secret === null) {
     return 'sin rol'
   }
+  // Only to a peer that accepted this pairing: a clash of roles, or an ask
+  // nobody accepted, never relays.
+  if ((await read($, link)) !== 'linked') {
+    await update($, pending, () => body)
+    await pause($, `sin enlace con ${short(to)}; el handoff queda retenido. Cuando acepte, /relevo resume lo envía.`)
+
+    return 'sin enlace'
+  }
+  // The cap holds on both sides, so neither one alone can loop.
   const limit = await limitOf($, maxRounds)
   const n = current === 'planner' ? (await read($, round)) + 1 : Math.max(1, await read($, round))
-  if (current === 'planner' && n > limit) {
+  if (n > limit) {
     await update($, pending, () => body)
     await pause($, `llegó a ${limit} rondas; en pausa (/relevo resume para seguir).`)
 
@@ -502,7 +511,8 @@ async function answerLink($: $, text: string): Promise<void> {
     return
   }
   await update($, link, () => 'linked')
-  $.ui.toast(`relevo: ${short(await read($, peer))} aceptó; sesiones enlazadas.`)
+  const held = (await read($, pending)) === null ? '' : ' /relevo resume envía lo retenido.'
+  $.ui.toast(`relevo: ${short(await read($, peer))} aceptó; sesiones enlazadas.${held}`)
 }
 
 export const register: Register = (on, options) => {

@@ -19,12 +19,13 @@ function engine(on: On, toasts: string[] = []) {
   })
 }
 
-function relay(on: On, toasts: string[] = []) {
+function relay(on: On, toasts: string[] = [], links: SessionSendInput[] = []) {
   const sent: SessionSendInput[] = []
   engine(on, toasts)
   on('session.send', ($, e) => {
-    // Round messages only; the link ones have tests of their own.
-    if (!e.text.startsWith('[relevo enlace')) sent.push(e)
+    // Round messages apart from the link ones.
+    if (e.text.startsWith('[relevo enlace')) links.push(e)
+    else sent.push(e)
 
     return { isDelivered: true }
   })
@@ -226,6 +227,73 @@ test('a lower round from the builder never resets the planner’s count', { opti
   expect(toasts.join('\n')).toContain('llegó a 2 rondas')
 })
 
+test('two builders never relay: nothing is sent without an accepted link', async ($, on) => {
+  const toasts: string[] = []
+  const sent = relay(on, toasts)
+  await command($, 'builder B')
+  // B, also set as builder, asks too: the roles clash, and nobody accepts.
+  await $.session.receive({ origin: FROM_RELEVO, text: linkAsk('builder', 'B', 'nonce-b') })
+  await turn($, '<handoff>Hecho: paso 1</handoff>')
+  await turn($, '<handoff>Hecho: paso 2</handoff>')
+
+  expect(sent.length).toBe(0)
+  const status = (await command($, 'status')).text
+  expect(status).toContain('en pausa')
+  expect(status).toContain('ronda 0/')
+  expect(toasts.join('\n')).toContain('sin enlace')
+})
+
+test('a handoff written before the ack waits, and resume sends it once linked', async ($, on) => {
+  const links: SessionSendInput[] = []
+  const sent = relay(on, [], links)
+  await command($, 'planner B')
+  await turn($, '<handoff>paso 1</handoff>')
+  expect(sent.length).toBe(0)
+  expect((await command($, 'resume')).text).toContain('sin enlace')
+  expect(sent.length).toBe(0)
+
+  const nonce = askIn(links)?.nonce ?? ''
+  await $.session.receive({ origin: FROM_RELEVO, text: linkOk('builder', nonce) })
+  expect((await command($, 'resume')).text).toContain('ronda 1 enviada')
+  expect(sent.map(one => one.text)).toEqual([`${header(1, 'planner', nonce)}\n\npaso 1`])
+})
+
+test('the builder stops at maxRounds too', { options: { maxRounds: 1 } }, async ($, on) => {
+  const toasts: string[] = []
+  const sent = relay(on, toasts)
+  const nonce = await linkAs($, 'builder', 'A')
+  await $.session.receive({ origin: FROM_RELEVO, text: `${header(1, 'planner', nonce)}\n\npaso 1` })
+  await turn($, '<handoff>hecho 1</handoff>')
+  await $.session.receive({ origin: FROM_RELEVO, text: `${header(2, 'planner', nonce)}\n\npaso 2` })
+  await turn($, '<handoff>hecho 2</handoff>')
+
+  expect(sent.map(one => one.text.split('\n')[0])).toEqual([header(1, 'builder', nonce)])
+  expect(toasts.join('\n')).toContain('llegó a 1 rondas')
+  expect((await command($, 'resume')).text).toContain('ronda 2 enviada')
+})
+
+test('a failed send is held, and resume sends it under the same round', async ($, on) => {
+  const toasts: string[] = []
+  const sent: SessionSendInput[] = []
+  let isUp = false
+  engine(on, toasts)
+  on('session.send', ($, e) => {
+    if (!isUp) return { isDelivered: false, reason: 'B no responde' }
+    sent.push(e)
+
+    return { isDelivered: true }
+  })
+  on('turn.complete', ($, e) => ({ text: e.answer }))
+  on('session.receive', ($, e) => ({ text: e.text }))
+  const nonce = await linkAs($, 'planner', 'B')
+  await turn($, '<handoff>paso 1</handoff>')
+  expect((await command($, 'status')).text).toContain('en pausa')
+
+  isUp = true
+  expect((await command($, 'resume')).text).toContain('ronda 1 enviada')
+  expect(sent.map(one => one.text)).toEqual([`${header(1, 'planner', nonce)}\n\npaso 1`])
+})
+
 test('a refused delivery pauses the relay', async ($, on) => {
   const toasts: string[] = []
   engine(on, toasts)
@@ -241,7 +309,7 @@ test('a refused delivery pauses the relay', async ($, on) => {
 
 test('the band shows role, peer and round on terminal and desktop', async ($, on) => {
   relay(on)
-  await command($, 'planner B')
+  await linkAs($, 'planner', 'B')
   await turn($, '<handoff>paso 1</handoff>')
 
   for (const surface of ['terminal', 'desktop'] as const) {
