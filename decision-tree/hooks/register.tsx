@@ -29,38 +29,372 @@ let isFullscreen: boolean | undefined
 // the workspace. Bash is judged per command by isReadOnlyShell.
 const FORK_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LSP', 'WebFetch', 'WebSearch', 'ToolSearch'])
 
-const SHELL_READERS = new Set([
-  'ls', 'cat', 'head', 'tail', 'grep', 'rg', 'find', 'wc', 'pwd', 'echo', 'which', 'file',
-  'stat', 'tree', 'du', 'df', 'date', 'sort', 'uniq', 'cut', 'tr', 'nl', 'diff', 'jq',
-  'basename', 'dirname', 'realpath', 'true',
+// The shell guard reads a command the way the shell will, then judges each
+// simple command against an allowlist of binaries and, per binary, of flags.
+//
+// Quoting: the command is split into words by a small shell-word lexer, so
+// a quoted flag (`'-delete'`) is judged as the flag it becomes. Quotes are
+// allowed because patterns need them (`jq '.x'`, `grep 'a|b'`). Inside single
+// quotes every character is literal; inside double quotes `$`, backtick and
+// backslash are refused, since the shell expands them there. Unquoted, only
+// plain characters pass (letters, digits, `_ . / : = , @ % + ~ -`, and `!` as a
+// word of its own): no expansion, substitution, redirection, globbing or
+// brace expansion. A glob is refused because it can expand to a file named
+// like a flag (`--pre=./x`); `ls src/*.ts` is therefore refused, and the Glob
+// tool is the way to list by pattern. The one redirection read is stderr's:
+// `2>&1`, `2>/dev/null`, `2> /dev/null`. This is held for bash and zsh alike.
+//
+// Flags: every flag must be one the binary's spec lists, deny by default.
+// Short flags may be bundled (`-la`); a value letter takes the rest of the
+// word (`-n5`) or the next word (`-n 5`). Long flags match exactly, never by
+// prefix (GNU and git accept unique prefixes, `--out` for `--output`), and a
+// long flag's value is read only from `--name=value`: the next word is always
+// judged on its own. A letter is listed as taking a value only where it does
+// on both GNU and BSD, so no word the tool reads as a flag escapes the check.
+
+type ShellSpec = {
+  /** Short letters that take no value; any order, bundled. */
+  short?: string
+  /** Short letters that take a value: the rest of the word, else the next word. */
+  shortValue?: string
+  /** Long flags given bare. */
+  long?: readonly string[]
+  /** Long flags given as `--name=value`. */
+  longValue?: readonly string[]
+  /** Whether `-N` (a count, as `head -50`) is a flag. */
+  count?: boolean
+  /** The most operands it takes; a bare `-` counts. Any when absent. */
+  maxOperands?: number
+  /** What every operand must be. */
+  operand?: (word: string) => boolean
+}
+
+const LOG_LONG = [
+  '--oneline', '--stat', '--shortstat', '--numstat', '--name-only', '--name-status', '--graph',
+  '--decorate', '--no-decorate', '--all', '--branches', '--tags', '--remotes', '--patch', '--follow',
+  '--reverse', '--no-merges', '--merges', '--abbrev-commit', '--no-abbrev-commit', '--first-parent',
+  '--color', '--no-color', '--summary', '--raw', '--topo-order', '--date-order', '--relative-date',
+  '--pretty', '--format', '--full-history', '--source', '--left-right',
+]
+const LOG_VALUE = [
+  '--format', '--pretty', '--since', '--until', '--after', '--before', '--author', '--committer', '--grep',
+  '--max-count', '--skip', '--date', '--decorate', '--color', '--abbrev', '--diff-filter', '--stat',
+]
+const DIFF_LONG = [
+  '--stat', '--shortstat', '--numstat', '--name-only', '--name-status', '--cached', '--staged', '--patch',
+  '--word-diff', '--color', '--no-color', '--minimal', '--patience', '--histogram', '--ignore-all-space',
+  '--ignore-space-change', '--check', '--summary', '--raw', '--relative', '--exit-code', '--quiet',
+  '--no-ext-diff', '--no-textconv',
+]
+const DIFF_VALUE = ['--unified', '--diff-filter', '--stat', '--color', '--word-diff', '--relative']
+
+const GIT_SPECS: Record<string, ShellSpec> = {
+  status: {
+    short: 'sbz',
+    long: ['--short', '--branch', '--porcelain', '--long', '--ignored', '--untracked-files'],
+    longValue: ['--porcelain', '--untracked-files', '--ignored'],
+  },
+  diff: { short: 'pRwbz', long: DIFF_LONG, longValue: DIFF_VALUE },
+  log: { short: 'pz', shortValue: 'nSG', count: true, long: LOG_LONG, longValue: LOG_VALUE },
+  show: {
+    short: 'pwz',
+    shortValue: 'n',
+    count: true,
+    long: [...LOG_LONG, ...DIFF_LONG],
+    longValue: [...LOG_VALUE, ...DIFF_VALUE],
+  },
+  blame: { short: 'wslefnpct', shortValue: 'L', long: ['--porcelain', '--line-porcelain', '--show-email'] },
+  'ls-files': {
+    short: 'cdmoiksutvfz',
+    long: ['--others', '--cached', '--modified', '--deleted', '--exclude-standard', '--error-unmatch', '--stage', '--full-name', '--directory'],
+    longValue: ['--exclude'],
+  },
+  'rev-parse': {
+    short: 'q',
+    long: [
+      '--show-toplevel', '--abbrev-ref', '--short', '--git-dir', '--git-common-dir', '--absolute-git-dir',
+      '--is-inside-work-tree', '--is-bare-repository', '--verify', '--symbolic-full-name', '--show-prefix', '--show-cdup',
+    ],
+    longValue: ['--short'],
+  },
+  describe: {
+    long: ['--tags', '--always', '--dirty', '--long', '--all', '--contains', '--exact-match'],
+    longValue: ['--abbrev', '--match', '--exclude', '--dirty'],
+  },
+  branch: { short: 'arv', long: ['--all', '--remotes', '--list', '--show-current', '--verbose'], maxOperands: 0 },
+  remote: { short: 'v', long: ['--verbose'], maxOperands: 0 },
+}
+
+const SHELL_SPECS: Record<string, ShellSpec | 'any'> = {
+  echo: 'any',
+  true: 'any',
+  pwd: { short: 'LP', maxOperands: 0 },
+  ls: {
+    short: 'aAbBcCdfFgGhHiklLmnopqQrRsStTuUvwx1',
+    long: ['--all', '--almost-all', '--human-readable', '--recursive', '--reverse', '--color', '--classify', '--directory'],
+    longValue: ['--color', '--sort', '--time-style'],
+  },
+  cat: { short: 'AbeEnstTuv', long: ['--number', '--number-nonblank', '--show-all', '--squeeze-blank'] },
+  head: { short: 'qv', shortValue: 'nc', count: true, long: ['--quiet', '--silent', '--verbose'], longValue: ['--lines', '--bytes'] },
+  // No -f, -F, --follow or --retry: a fork that follows a file never ends.
+  tail: { short: 'qrv', shortValue: 'nc', count: true, long: ['--quiet', '--silent', '--verbose'], longValue: ['--lines', '--bytes'] },
+  grep: {
+    short: 'rRnilLcvwxoqsHhEFGIPabU',
+    shortValue: 'efmABCdD',
+    count: true,
+    long: [
+      '--recursive', '--line-number', '--ignore-case', '--files-with-matches', '--files-without-match', '--count',
+      '--word-regexp', '--line-regexp', '--fixed-strings', '--extended-regexp', '--perl-regexp', '--only-matching',
+      '--no-filename', '--with-filename', '--invert-match', '--color', '--colour', '--quiet', '--no-messages',
+    ],
+    longValue: ['--include', '--exclude', '--exclude-dir', '--color', '--colour', '--max-count', '--context', '--binary-files'],
+  },
+  // No --pre, --pre-glob or --hostname-bin (each runs a program), nor -z
+  // (runs decompressors).
+  rg: {
+    short: 'nNiIsSlcwxvFuoHLpq0.UPabh',
+    shortValue: 'eftTgABCmMjErd',
+    long: [
+      '--files', '--hidden', '--no-ignore', '--no-ignore-vcs', '--no-heading', '--heading', '--count', '--json',
+      '--vimgrep', '--line-number', '--no-line-number', '--ignore-case', '--smart-case', '--case-sensitive',
+      '--fixed-strings', '--word-regexp', '--files-with-matches', '--files-without-match', '--follow', '--type-list',
+      '--multiline', '--only-matching', '--invert-match', '--no-messages', '--count-matches', '--with-filename',
+    ],
+    longValue: [
+      '--glob', '--iglob', '--type', '--type-not', '--max-count', '--max-depth', '--max-columns', '--color', '--sort',
+      '--sortr', '--context', '--after-context', '--before-context', '--max-filesize',
+    ],
+  },
+  wc: { short: 'lwcmL', long: ['--lines', '--words', '--bytes', '--chars', '--max-line-length'] },
+  which: { short: 'as' },
+  // No -C or -m (compile and choose magic files), nor -z (runs decompressors).
+  file: { short: 'bhiLkN', long: ['--mime', '--mime-type', '--mime-encoding', '--brief', '--dereference', '--no-dereference'] },
+  stat: { short: 'LflrsxFtq', shortValue: 'c', long: ['--dereference', '--terse'], longValue: ['--format', '--printf'] },
+  // No -o (writes the listing), -H or -R (write HTML files).
+  tree: {
+    short: 'adfilspugDFCnNqvrtUxAShJX',
+    shortValue: 'LIP',
+    long: ['--dirsfirst', '--noreport', '--gitignore', '--prune'],
+  },
+  du: { short: 'ahcskmxLHP0', shortValue: 'd', long: ['--human-readable', '--summarize', '--apparent-size'], longValue: ['--max-depth'] },
+  df: { short: 'hHkilTPa', long: ['--human-readable'] },
+  // Only `+FORMAT` operands: on BSD a bare operand sets the clock; no -s,
+  // --set or -d either.
+  date: {
+    short: 'uRjI',
+    shortValue: 'rv',
+    long: ['--utc', '--universal', '--iso-8601', '--rfc-email'],
+    longValue: ['--iso-8601', '--rfc-3339', '--reference', '--date'],
+    operand: word => word.startsWith('+'),
+  },
+  // No -o/--output, -T/--temporary-directory or --compress-program (runs a program).
+  sort: {
+    short: 'bdfgiMhnRrVuscCmz',
+    shortValue: 'tkS',
+    long: [
+      '--reverse', '--unique', '--numeric-sort', '--human-numeric-sort', '--version-sort', '--ignore-case',
+      '--general-numeric-sort', '--month-sort', '--stable', '--check', '--merge', '--zero-terminated',
+      '--dictionary-order', '--ignore-leading-blanks', '--random-sort',
+    ],
+    longValue: ['--key', '--field-separator', '--buffer-size', '--sort'],
+  },
+  // A second operand is the file uniq writes to.
+  uniq: {
+    short: 'cdDuiz',
+    shortValue: 'fsw',
+    long: ['--count', '--repeated', '--unique', '--ignore-case'],
+    longValue: ['--skip-fields', '--skip-chars', '--check-chars'],
+    maxOperands: 1,
+  },
+  cut: {
+    short: 'snw',
+    shortValue: 'bcfd',
+    long: ['--complement', '--only-delimited'],
+    longValue: ['--delimiter', '--fields', '--characters', '--bytes'],
+  },
+  tr: { short: 'cCdsu', maxOperands: 2 },
+  nl: { short: 'p', shortValue: 'bdfhilnsvw' },
+  diff: {
+    short: 'uaBbdEeiNnpqrsTtwy',
+    shortValue: 'UCDILFSWxX',
+    long: ['--unified', '--recursive', '--brief', '--side-by-side', '--ignore-all-space', '--ignore-space-change', '--new-file', '--text'],
+    longValue: ['--unified', '--color', '--exclude', '--label'],
+    maxOperands: 2,
+  },
+  jq: {
+    short: 'rcensSjaCMRf',
+    long: [
+      '--raw-output', '--compact-output', '--slurp', '--null-input', '--sort-keys', '--join-output', '--exit-status',
+      '--raw-input', '--ascii-output', '--tab', '--indent', '--arg', '--argjson', '--slurpfile', '--rawfile', '--args', '--jsonargs',
+    ],
+  },
+  basename: { short: 'az', shortValue: 's', long: ['--multiple', '--zero'], longValue: ['--suffix'] },
+  dirname: { short: 'z', long: ['--zero'] },
+  realpath: { short: 'eEmLPqsz', longValue: ['--relative-to', '--relative-base'] },
+}
+
+// find's expression: tests and actions that only read and print.
+const FIND_LEADING = new Set(['-H', '-L', '-P', '-E'])
+const FIND_PLAIN = new Set([
+  '-print', '-print0', '-prune', '-empty', '-depth', '-xdev', '-mount', '-follow', '-readable', '-executable',
+  '-nouser', '-nogroup', '-true', '-false', '-not', '-a', '-o', '-and', '-or', '!', '(', ')', '-ls',
 ])
-const GIT_READERS = new Set(['status', 'diff', 'log', 'show', 'blame', 'ls-files', 'rev-parse', 'describe'])
-const GIT_LISTING_FLAGS = new Set(['-a', '-r', '-v', '-vv', '--all', '--remotes', '--list', '--show-current'])
+const FIND_VALUE = new Set([
+  '-name', '-iname', '-path', '-ipath', '-wholename', '-iwholename', '-regex', '-iregex', '-type', '-xtype',
+  '-maxdepth', '-mindepth', '-size', '-mtime', '-mmin', '-atime', '-amin', '-ctime', '-cmin', '-newer', '-perm',
+  '-user', '-group', '-uid', '-gid', '-links', '-inum', '-samefile', '-lname', '-ilname',
+])
 
-function isReadOnlyStep(step: string): boolean {
-  const words = step.split(/\s+/)
-  const [bin = '', sub = ''] = words
-  const rest = words.slice(2)
-  if (/\s(-o|--output)(\s|=|$)/.test(step)) return false
-  if (bin === 'git') {
-    if (sub === 'branch' || sub === 'remote') return rest.every(flag => GIT_LISTING_FLAGS.has(flag))
-    return GIT_READERS.has(sub)
+/** Whether find's words (after `find`) read and print only. */
+function findReadsOnly(words: readonly string[]): boolean {
+  let i = 0
+  while (i < words.length && FIND_LEADING.has(words[i] ?? '')) i += 1
+  // The starting points: words up to the first that opens the expression.
+  while (i < words.length && !/^[-!()]/.test(words[i] ?? '')) i += 1
+  while (i < words.length) {
+    const word = words[i] ?? ''
+    if (FIND_VALUE.has(word)) {
+      if (i + 1 >= words.length) return false
+      i += 2
+    } else if (FIND_PLAIN.has(word)) {
+      i += 1
+    } else {
+      return false
+    }
   }
-  if (bin === 'find') return !/\s-(delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)\b/.test(step)
-  if (bin === 'uniq') return words.slice(1).filter(word => !word.startsWith('-')).length <= 1
+  return true
+}
 
-  return SHELL_READERS.has(bin)
+/** Whether the words after a binary (or a git subcommand) keep to its spec. */
+function keepsToSpec(words: readonly string[], spec: ShellSpec): boolean {
+  let operands = 0
+  let isPastFlags = false
+  for (let i = 0; i < words.length; i += 1) {
+    const word = words[i] ?? ''
+    if (!isPastFlags && word === '--') {
+      isPastFlags = true
+      continue
+    }
+    if (isPastFlags || word === '-' || !word.startsWith('-')) {
+      operands += 1
+      if (spec.operand !== undefined && !spec.operand(word)) return false
+      continue
+    }
+    if (word.startsWith('--')) {
+      const eq = word.indexOf('=')
+      const name = eq === -1 ? word : word.slice(0, eq)
+      const isListed = eq === -1 ? (spec.long ?? []).includes(name) : (spec.longValue ?? []).includes(name)
+      if (!isListed) return false
+      continue
+    }
+    if (spec.count === true && /^-\d+$/.test(word)) continue
+
+    const letters = word.slice(1)
+    for (let j = 0; j < letters.length; j += 1) {
+      const letter = letters[j] ?? ''
+      if ((spec.short ?? '').includes(letter)) continue
+      if (!(spec.shortValue ?? '').includes(letter)) return false
+      // A value letter takes the rest of the word, or else the next word.
+      if (j === letters.length - 1) {
+        if (i + 1 >= words.length) return false
+        i += 1
+      }
+      break
+    }
+  }
+  return spec.maxOperands === undefined || operands <= spec.maxOperands
+}
+
+// A spec of the table's own, never one inherited (`toString`, `constructor`).
+function specOf<T>(table: Record<string, T>, name: string): T | undefined {
+  return Object.prototype.hasOwnProperty.call(table, name) ? table[name] : undefined
+}
+
+function isReadOnlyStep(words: readonly string[]): boolean {
+  const [bin = '', ...rest] = words
+  if (bin === 'find') return findReadsOnly(rest)
+  if (bin === 'git') {
+    // Nothing between git and its subcommand: -c and -C change what runs.
+    const [sub = '', ...args] = rest
+    const spec = specOf(GIT_SPECS, sub)
+    return spec !== undefined && keepsToSpec(args, spec)
+  }
+  const spec = specOf(SHELL_SPECS, bin)
+  if (spec === undefined) return false
+  return spec === 'any' || keepsToSpec(rest, spec)
+}
+
+const PLAIN_CHAR = /[A-Za-z0-9_./:=,@%+~-]/
+const STDERR_REDIRECTS = ['2>&1', '2>/dev/null', '2> /dev/null']
+
+/**
+ * The simple commands of a command line, each as the words the shell would
+ * pass, quotes removed; null when the line holds anything the lexer does not
+ * read as plain (see the comment above ShellSpec).
+ */
+export function shellSteps(command: string): string[][] | null {
+  const steps: string[][] = []
+  let words: string[] = []
+  let word: string | null = null
+  const endWord = () => {
+    if (word !== null) words.push(word)
+    word = null
+  }
+  const endStep = () => {
+    endWord()
+    if (words.length > 0) steps.push(words)
+    words = []
+  }
+  const isBoundary = (at: number) => at >= command.length || /[\s;&|]/.test(command[at] ?? '')
+
+  let i = 0
+  while (i < command.length) {
+    const c = command[i] ?? ''
+    if (word === null) {
+      const redirect = STDERR_REDIRECTS.find(r => command.startsWith(r, i) && isBoundary(i + r.length))
+      if (redirect !== undefined) {
+        i += redirect.length
+        continue
+      }
+      if (c === '!' && isBoundary(i + 1)) {
+        words.push('!')
+        i += 1
+        continue
+      }
+    }
+    if (c === "'") {
+      const close = command.indexOf("'", i + 1)
+      if (close === -1) return null
+      word = (word ?? '') + command.slice(i + 1, close)
+      i = close + 1
+    } else if (c === '"') {
+      const close = command.indexOf('"', i + 1)
+      if (close === -1) return null
+      const inner = command.slice(i + 1, close)
+      if (/[$`\\]/.test(inner)) return null
+      word = (word ?? '') + inner
+      i = close + 1
+    } else if (c === ' ' || c === '\t') {
+      endWord()
+      i += 1
+    } else if (c === '\n' || c === ';' || c === '|' || c === '&') {
+      // `|`, `||`, `&&`, `&`, `;` and a newline all end a simple command.
+      endStep()
+      i += 1
+    } else if (PLAIN_CHAR.test(c)) {
+      word = (word ?? '') + c
+      i += 1
+    } else {
+      return null
+    }
+  }
+  endStep()
+  return steps
 }
 
 export function isReadOnlyShell(command: string): boolean {
-  const cleaned = command.replace(/\s2>&1/g, '').replace(/\s2>\s*\/dev\/null/g, '')
-  if (/[>`]|\$\(|<\(/.test(cleaned)) return false
-
-  return cleaned
-    .split(/&&|\|\||[;&|\n]/)
-    .map(step => step.trim())
-    .filter(step => step.length > 0)
-    .every(isReadOnlyStep)
+  const steps = shellSteps(command)
+  return steps !== null && steps.length > 0 && steps.every(isReadOnlyStep)
 }
 
 /** Whether a fork this plugin started may make this call: read and look up, never change. */

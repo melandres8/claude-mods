@@ -132,6 +132,138 @@ test('read-only shell check', () => {
   expect(isReadOnlyShell('sort f | uniq -c')).toBe(true)
 })
 
+// Each input below got past the guard once; none may again.
+const SHELL_BYPASSES = [
+  // rg runs a preprocessor or a hostname program of the caller's choosing.
+  'rg --pre rm x .',
+  'rg --pre=rm x .',
+  'rg --pre-glob "*" --pre rm x .',
+  'rg --hostname-bin=sh x .',
+  'rg --pr rm x .',
+  // A quote does not hide a flag.
+  'find . "-delete"',
+  "find . '-exec' rm {} +",
+  "find . '-exec' rm '{}' '+'",
+  "sort '-o' f in",
+  // Attached, bundled and abbreviated output flags.
+  'sort -uo src/index.ts /dev/null',
+  'sort -osrc/x in',
+  'sort --out=f in',
+  'sort --output=f in',
+  'git log --outp=f',
+  'git log --output=f',
+  'tree -ofile',
+  'tree -R -H .',
+  // A bare - is an operand: here it makes path/file the output.
+  'uniq - path/file',
+  'sort --compress-program=sh in',
+  'sort --compress-program sh in',
+  'file -C -m x',
+  'tail -f log',
+  'tail -F log',
+  'tail --follow log',
+  'tail -n5 -f log',
+  'date -s 12:00',
+  'date --set=12:00',
+  'date 202610121200',
+  // Expansion, substitution and redirection in any spelling.
+  'echo $HOME',
+  'echo "$(rm -rf x)"',
+  'echo "`rm -rf x`"',
+  "echo 'a' > f",
+  'cat f >> g',
+  'cat < f',
+  'echo hi >| f',
+  'ls \\\n-la',
+  'grep foo f\\;rm x',
+  // A glob can expand to a file named like a flag.
+  'rg foo *',
+  'ls src/*.ts',
+  'find . {-delete,}',
+  'ls [a]',
+  // Separators inside and outside quotes.
+  "grep 'a|b' f; rm x",
+  'ls && rm x',
+  'ls || rm x',
+  'ls\nrm x',
+  'ls & rm x',
+  // Unterminated quotes, prefixes, and unknown binaries.
+  "grep 'foo f",
+  'FOO=1 ls',
+  '/bin/rm x',
+  'command rm x',
+  'xargs rm',
+  'toString',
+  'git constructor',
+  'git -c core.pager=sh log',
+  'git -C .. log',
+  'git log --ext-diff -p',
+  'git diff --output=x',
+  'git branch newname',
+  'git stash',
+  'git checkout .',
+]
+
+test('read-only shell check refuses every known bypass', () => {
+  expect(SHELL_BYPASSES.filter(command => isReadOnlyShell(command))).toEqual([])
+})
+
+// What a fork uses every day must keep working.
+const SHELL_READS = [
+  'ls',
+  'ls -la',
+  'ls -la src',
+  'grep -rn foo src',
+  'grep -rn "foo bar" src',
+  "grep -E 'a|b$' src/x.ts",
+  'grep -rn foo --include=x.ts src',
+  "grep -rn foo --include='*.ts' src",
+  'rg -n foo',
+  "rg -n 'foo\\(' -g '*.ts' src",
+  'rg --files',
+  "find . -name '*.ts' -type f",
+  'find src -maxdepth 2 -type d',
+  "find . -name '*.md' -not -path './node_modules/*'",
+  'git log --oneline',
+  'git log --oneline -5',
+  'git log -n 3 --stat',
+  'git diff --stat',
+  'git diff HEAD~1 -- src/x.ts',
+  'git show HEAD:src/x.ts',
+  'git status --short',
+  'git branch -vv',
+  'git rev-parse --show-toplevel',
+  'head -n 20 f',
+  'head -50 f',
+  'tail -n 20 f',
+  'wc -l f g',
+  'sort -u f',
+  'sort -rn f',
+  'sort f | uniq -c | sort -rn | head -5',
+  'uniq -c in',
+  "jq '.x' package.json",
+  "jq -r '.scripts | keys[]' package.json",
+  'cat package.json 2>&1',
+  'cat f 2> /dev/null',
+  'pwd',
+  'echo hola',
+  'date +%Y-%m-%d',
+  'date -u',
+  'which node',
+  'tree -L 2 src',
+  'du -sh src',
+  'diff -u a b',
+  'file f',
+  'stat f',
+  'cut -d: -f1 f',
+  "tr -d '\\r'",
+  'basename src/x.ts .ts',
+]
+
+test('read-only shell check keeps the everyday reads', () => {
+  expect(SHELL_READS.filter(command => !isReadOnlyShell(command))).toEqual([])
+})
+
 test('what a fork may call', () => {
   expect(forkMayCall('Read', {})).toBe(true)
   expect(forkMayCall('Grep', {})).toBe(true)
