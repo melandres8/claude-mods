@@ -18,49 +18,400 @@ const focus = atom({ plugin: 'decision-tree', key: 'focus' } as const, 0)
 const picks = atom({ plugin: 'decision-tree', key: 'picks' } as const, {})
 const implications = atom({ plugin: 'decision-tree', key: 'implications' } as const, {})
 const forks = atom({ plugin: 'decision-tree', key: 'forks' } as const, {})
-// Every fork this plugin started, never reset, so the guard below keeps
-// holding a fork that outlives the ask it was started for.
+// Every fork this plugin started, never reset nor capped, so the guard below
+// keeps holding a fork that outlives the ask it was started for.
 const forkIds = atom({ plugin: 'decision-tree', key: 'forkIds' } as const, [])
+
+// The guard's own memory, for its .catch, which may not call $: the forks it
+// knows, the agents listed as someone else's, and the spawns under way, whose
+// forks can call tools before $.agent.spawn hands back their id.
+const knownForks = new Set<string>()
+const foreignAgents = new Set<string>()
+let pendingSpawns = 0
 
 // What the last drawing said about the layout; unknown until the pane draws.
 let isFullscreen: boolean | undefined
 
-// What a fork may call: reading and looking things up, nothing that changes
-// the workspace. Bash is judged per command by isReadOnlyShell.
-const FORK_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LSP', 'WebFetch', 'WebSearch', 'ToolSearch'])
+// What a fork may call: reading the workspace, nothing that changes it.
+// Bash is judged per command by isReadOnlyShell. No WebFetch or WebSearch: a
+// fork may read secrets (.env), and a URL or a query would carry them out.
+const FORK_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LSP', 'ToolSearch'])
 
-const SHELL_READERS = new Set([
-  'ls', 'cat', 'head', 'tail', 'grep', 'rg', 'find', 'wc', 'pwd', 'echo', 'which', 'file',
-  'stat', 'tree', 'du', 'df', 'date', 'sort', 'uniq', 'cut', 'tr', 'nl', 'diff', 'jq',
-  'basename', 'dirname', 'realpath', 'true',
+// The shell guard reads a command the way the shell will, then judges each
+// simple command against an allowlist of binaries and, per binary, of flags.
+//
+// Quoting: the command is split into words by a small shell-word lexer, so
+// a quoted flag (`'-delete'`) is judged as the flag it becomes. Quotes are
+// allowed because patterns need them (`jq '.x'`, `grep 'a|b'`). Inside single
+// quotes every character is literal; inside double quotes `$`, backtick and
+// backslash are refused, since the shell expands them there. Unquoted, only
+// plain characters pass (letters, digits, `_ . / : = , @ % + ~ -`, and `!` as a
+// word of its own): no expansion, substitution, redirection, globbing or
+// brace expansion. A glob is refused because it can expand to a file named
+// like a flag (`--pre=./x`); `ls src/*.ts` is therefore refused, and the Glob
+// tool is the way to list by pattern. The one redirection read is stderr's:
+// `2>&1`, `2>/dev/null`, `2> /dev/null`. This is held for bash and zsh alike.
+//
+// Flags: every flag must be one the binary's spec lists, deny by default.
+// Short flags may be bundled (`-la`); a value letter takes the rest of the
+// word (`-n5`) or the next word (`-n 5`). Long flags match exactly, never by
+// prefix (GNU and git accept unique prefixes, `--out` for `--output`), and a
+// long flag's value is read only from `--name=value`: the next word is always
+// judged on its own. A letter is listed as taking a value only where every
+// GNU or BSD tool that knows it takes one (one that lacks it fails), so no
+// word the tool reads as a flag escapes the check.
+
+type ShellSpec = {
+  /** Short letters that take no value; any order, bundled. */
+  short?: string
+  /** Short letters that take a value: the rest of the word, else the next word. */
+  shortValue?: string
+  /** Long flags given bare. */
+  long?: readonly string[]
+  /** Long flags given as `--name=value`. */
+  longValue?: readonly string[]
+  /** Whether `-N` (a count, as `head -50`) is a flag. */
+  count?: boolean
+  /** The most operands it takes; a bare `-` counts. Any when absent. */
+  maxOperands?: number
+  /** What every operand must be. */
+  operand?: (word: string) => boolean
+}
+
+const LOG_LONG = [
+  '--oneline', '--stat', '--shortstat', '--numstat', '--name-only', '--name-status', '--graph',
+  '--decorate', '--no-decorate', '--all', '--branches', '--tags', '--remotes', '--patch', '--follow',
+  '--reverse', '--no-merges', '--merges', '--abbrev-commit', '--no-abbrev-commit', '--first-parent',
+  '--color', '--no-color', '--summary', '--raw', '--topo-order', '--date-order', '--relative-date',
+  '--pretty', '--format', '--full-history', '--source', '--left-right',
+]
+const LOG_VALUE = [
+  '--format', '--pretty', '--since', '--until', '--after', '--before', '--author', '--committer', '--grep',
+  '--max-count', '--skip', '--date', '--decorate', '--color', '--abbrev', '--diff-filter', '--stat',
+]
+const DIFF_LONG = [
+  '--stat', '--shortstat', '--numstat', '--name-only', '--name-status', '--cached', '--staged', '--patch',
+  '--word-diff', '--color', '--no-color', '--minimal', '--patience', '--histogram', '--ignore-all-space',
+  '--ignore-space-change', '--check', '--summary', '--raw', '--relative', '--exit-code', '--quiet',
+  '--no-ext-diff', '--no-textconv',
+]
+const DIFF_VALUE = ['--unified', '--diff-filter', '--stat', '--color', '--word-diff', '--relative']
+
+const GIT_SPECS: Record<string, ShellSpec> = {
+  status: {
+    short: 'sbz',
+    long: ['--short', '--branch', '--porcelain', '--long', '--ignored', '--untracked-files'],
+    longValue: ['--porcelain', '--untracked-files', '--ignored'],
+  },
+  diff: { short: 'pRwbz', long: DIFF_LONG, longValue: DIFF_VALUE },
+  log: { short: 'pz', shortValue: 'nSG', count: true, long: LOG_LONG, longValue: LOG_VALUE },
+  show: {
+    short: 'pwz',
+    shortValue: 'n',
+    count: true,
+    long: [...LOG_LONG, ...DIFF_LONG],
+    longValue: [...LOG_VALUE, ...DIFF_VALUE],
+  },
+  blame: { short: 'wslefnpct', shortValue: 'L', long: ['--porcelain', '--line-porcelain', '--show-email'] },
+  'ls-files': {
+    short: 'cdmoiksutvfz',
+    long: ['--others', '--cached', '--modified', '--deleted', '--exclude-standard', '--error-unmatch', '--stage', '--full-name', '--directory'],
+    longValue: ['--exclude'],
+  },
+  'rev-parse': {
+    short: 'q',
+    long: [
+      '--show-toplevel', '--abbrev-ref', '--short', '--git-dir', '--git-common-dir', '--absolute-git-dir',
+      '--is-inside-work-tree', '--is-bare-repository', '--verify', '--symbolic-full-name', '--show-prefix', '--show-cdup',
+    ],
+    longValue: ['--short'],
+  },
+  describe: {
+    long: ['--tags', '--always', '--dirty', '--long', '--all', '--contains', '--exact-match'],
+    longValue: ['--abbrev', '--match', '--exclude', '--dirty'],
+  },
+  branch: { short: 'arv', long: ['--all', '--remotes', '--list', '--show-current', '--verbose'], maxOperands: 0 },
+  remote: { short: 'v', long: ['--verbose'], maxOperands: 0 },
+}
+
+const SHELL_SPECS: Record<string, ShellSpec | 'any'> = {
+  echo: 'any',
+  true: 'any',
+  pwd: { short: 'LP', maxOperands: 0 },
+  ls: {
+    short: 'aAbBcCdfFgGhHiklLmnopqQrRsStTuUvwx1',
+    long: ['--all', '--almost-all', '--human-readable', '--recursive', '--reverse', '--color', '--classify', '--directory'],
+    longValue: ['--color', '--sort', '--time-style'],
+  },
+  cat: { short: 'AbeEnstTuv', long: ['--number', '--number-nonblank', '--show-all', '--squeeze-blank'] },
+  head: { short: 'qv', shortValue: 'nc', count: true, long: ['--quiet', '--silent', '--verbose'], longValue: ['--lines', '--bytes'] },
+  // No -f, -F, --follow or --retry: a fork that follows a file never ends. No
+  // operand starting with +: the traditional form `tail +5f` follows too.
+  tail: {
+    short: 'qrv',
+    shortValue: 'nc',
+    count: true,
+    long: ['--quiet', '--silent', '--verbose'],
+    longValue: ['--lines', '--bytes'],
+    operand: word => !word.startsWith('+'),
+  },
+  grep: {
+    short: 'rRnilLcvwxoqsHhEFGIPabU',
+    shortValue: 'efmABCdD',
+    count: true,
+    long: [
+      '--recursive', '--line-number', '--ignore-case', '--files-with-matches', '--files-without-match', '--count',
+      '--word-regexp', '--line-regexp', '--fixed-strings', '--extended-regexp', '--perl-regexp', '--only-matching',
+      '--no-filename', '--with-filename', '--invert-match', '--color', '--colour', '--quiet', '--no-messages',
+    ],
+    longValue: ['--include', '--exclude', '--exclude-dir', '--color', '--colour', '--max-count', '--context', '--binary-files'],
+  },
+  // No --pre, --pre-glob or --hostname-bin (each runs a program), nor -z
+  // (runs decompressors).
+  rg: {
+    short: 'nNiIsSlcwxvFuoHLpq0.UPabh',
+    shortValue: 'eftTgABCmMjErd',
+    long: [
+      '--files', '--hidden', '--no-ignore', '--no-ignore-vcs', '--no-heading', '--heading', '--count', '--json',
+      '--vimgrep', '--line-number', '--no-line-number', '--ignore-case', '--smart-case', '--case-sensitive',
+      '--fixed-strings', '--word-regexp', '--files-with-matches', '--files-without-match', '--follow', '--type-list',
+      '--multiline', '--only-matching', '--invert-match', '--no-messages', '--count-matches', '--with-filename',
+    ],
+    longValue: [
+      '--glob', '--iglob', '--type', '--type-not', '--max-count', '--max-depth', '--max-columns', '--color', '--sort',
+      '--sortr', '--context', '--after-context', '--before-context', '--max-filesize',
+    ],
+  },
+  wc: { short: 'lwcmL', long: ['--lines', '--words', '--bytes', '--chars', '--max-line-length'] },
+  which: { short: 'as' },
+  // No -C or -m (compile and choose magic files), nor -z (runs decompressors).
+  file: { short: 'bhiLkN', long: ['--mime', '--mime-type', '--mime-encoding', '--brief', '--dereference', '--no-dereference'] },
+  stat: { short: 'LflrsxFtq', shortValue: 'c', long: ['--dereference', '--terse'], longValue: ['--format', '--printf'] },
+  // No -o (writes the listing), -H or -R (write HTML files).
+  tree: {
+    short: 'adfilspugDFCnNqvrtUxAShJX',
+    shortValue: 'LIP',
+    long: ['--dirsfirst', '--noreport', '--gitignore', '--prune'],
+  },
+  du: { short: 'ahcskmxLHP0', shortValue: 'd', long: ['--human-readable', '--summarize', '--apparent-size'], longValue: ['--max-depth'] },
+  df: { short: 'hHkilTPa', long: ['--human-readable'] },
+  // Only `+FORMAT` operands: on BSD a bare operand sets the clock; no -s,
+  // --set or -d either.
+  date: {
+    short: 'uRjI',
+    shortValue: 'rv',
+    long: ['--utc', '--universal', '--iso-8601', '--rfc-email'],
+    longValue: ['--iso-8601', '--rfc-3339', '--reference', '--date'],
+    operand: word => word.startsWith('+'),
+  },
+  // No -o/--output, -T/--temporary-directory or --compress-program (runs a program).
+  sort: {
+    short: 'bdfgiMhnRrVuscCmz',
+    shortValue: 'tkS',
+    long: [
+      '--reverse', '--unique', '--numeric-sort', '--human-numeric-sort', '--version-sort', '--ignore-case',
+      '--general-numeric-sort', '--month-sort', '--stable', '--check', '--merge', '--zero-terminated',
+      '--dictionary-order', '--ignore-leading-blanks', '--random-sort',
+    ],
+    longValue: ['--key', '--field-separator', '--buffer-size', '--sort'],
+  },
+  // A second operand is the file uniq writes to.
+  uniq: {
+    short: 'cdDuiz',
+    shortValue: 'fsw',
+    long: ['--count', '--repeated', '--unique', '--ignore-case'],
+    longValue: ['--skip-fields', '--skip-chars', '--check-chars'],
+    maxOperands: 1,
+  },
+  cut: {
+    short: 'snw',
+    shortValue: 'bcfd',
+    long: ['--complement', '--only-delimited'],
+    longValue: ['--delimiter', '--fields', '--characters', '--bytes'],
+  },
+  tr: { short: 'cCdsu', maxOperands: 2 },
+  nl: { short: 'p', shortValue: 'bdfhilnsvw' },
+  diff: {
+    short: 'uaBbdEeiNnpqrsTtwy',
+    shortValue: 'UCDILFSWxX',
+    long: ['--unified', '--recursive', '--brief', '--side-by-side', '--ignore-all-space', '--ignore-space-change', '--new-file', '--text'],
+    longValue: ['--unified', '--color', '--exclude', '--label'],
+    maxOperands: 2,
+  },
+  jq: {
+    short: 'rcensSjaCMRf',
+    long: [
+      '--raw-output', '--compact-output', '--slurp', '--null-input', '--sort-keys', '--join-output', '--exit-status',
+      '--raw-input', '--ascii-output', '--tab', '--indent', '--arg', '--argjson', '--slurpfile', '--rawfile', '--args', '--jsonargs',
+    ],
+  },
+  basename: { short: 'az', shortValue: 's', long: ['--multiple', '--zero'], longValue: ['--suffix'] },
+  dirname: { short: 'z', long: ['--zero'] },
+  realpath: { short: 'eEmLPqsz', longValue: ['--relative-to', '--relative-base'] },
+}
+
+// find's expression: tests and actions that only read and print.
+const FIND_LEADING = new Set(['-H', '-L', '-P', '-E'])
+const FIND_PLAIN = new Set([
+  '-print', '-print0', '-prune', '-empty', '-depth', '-xdev', '-mount', '-follow', '-readable', '-executable',
+  '-nouser', '-nogroup', '-true', '-false', '-not', '-a', '-o', '-and', '-or', '!', '(', ')', '-ls',
 ])
-const GIT_READERS = new Set(['status', 'diff', 'log', 'show', 'blame', 'ls-files', 'rev-parse', 'describe'])
-const GIT_LISTING_FLAGS = new Set(['-a', '-r', '-v', '-vv', '--all', '--remotes', '--list', '--show-current'])
+const FIND_VALUE = new Set([
+  '-name', '-iname', '-path', '-ipath', '-wholename', '-iwholename', '-regex', '-iregex', '-type', '-xtype',
+  '-maxdepth', '-mindepth', '-size', '-mtime', '-mmin', '-atime', '-amin', '-ctime', '-cmin', '-newer', '-perm',
+  '-user', '-group', '-uid', '-gid', '-links', '-inum', '-samefile', '-lname', '-ilname',
+])
 
-function isReadOnlyStep(step: string): boolean {
-  const words = step.split(/\s+/)
-  const [bin = '', sub = ''] = words
-  const rest = words.slice(2)
-  if (/\s(-o|--output)(\s|=|$)/.test(step)) return false
-  if (bin === 'git') {
-    if (sub === 'branch' || sub === 'remote') return rest.every(flag => GIT_LISTING_FLAGS.has(flag))
-    return GIT_READERS.has(sub)
+/** Whether find's words (after `find`) read and print only. */
+function findReadsOnly(words: readonly string[]): boolean {
+  let i = 0
+  while (i < words.length && FIND_LEADING.has(words[i] ?? '')) i += 1
+  // The starting points: words up to the first that opens the expression.
+  while (i < words.length && !/^[-!()]/.test(words[i] ?? '')) i += 1
+  while (i < words.length) {
+    const word = words[i] ?? ''
+    if (FIND_VALUE.has(word)) {
+      if (i + 1 >= words.length) return false
+      i += 2
+    } else if (FIND_PLAIN.has(word)) {
+      i += 1
+    } else {
+      return false
+    }
   }
-  if (bin === 'find') return !/\s-(delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)\b/.test(step)
-  if (bin === 'uniq') return words.slice(1).filter(word => !word.startsWith('-')).length <= 1
+  return true
+}
 
-  return SHELL_READERS.has(bin)
+/** Whether the words after a binary (or a git subcommand) keep to its spec. */
+function keepsToSpec(words: readonly string[], spec: ShellSpec): boolean {
+  let operands = 0
+  let isPastFlags = false
+  for (let i = 0; i < words.length; i += 1) {
+    const word = words[i] ?? ''
+    if (!isPastFlags && word === '--') {
+      isPastFlags = true
+      continue
+    }
+    if (isPastFlags || word === '-' || !word.startsWith('-')) {
+      operands += 1
+      if (spec.operand !== undefined && !spec.operand(word)) return false
+      continue
+    }
+    if (word.startsWith('--')) {
+      const eq = word.indexOf('=')
+      const name = eq === -1 ? word : word.slice(0, eq)
+      const isListed = eq === -1 ? (spec.long ?? []).includes(name) : (spec.longValue ?? []).includes(name)
+      if (!isListed) return false
+      continue
+    }
+    if (spec.count === true && /^-\d+$/.test(word)) continue
+
+    const letters = word.slice(1)
+    for (let j = 0; j < letters.length; j += 1) {
+      const letter = letters[j] ?? ''
+      if ((spec.short ?? '').includes(letter)) continue
+      if (!(spec.shortValue ?? '').includes(letter)) return false
+      // A value letter takes the rest of the word, or else the next word.
+      if (j === letters.length - 1) {
+        if (i + 1 >= words.length) return false
+        i += 1
+      }
+      break
+    }
+  }
+  return spec.maxOperands === undefined || operands <= spec.maxOperands
+}
+
+// A spec of the table's own, never one inherited (`toString`, `constructor`).
+function specOf<T>(table: Record<string, T>, name: string): T | undefined {
+  return Object.prototype.hasOwnProperty.call(table, name) ? table[name] : undefined
+}
+
+function isReadOnlyStep(words: readonly string[]): boolean {
+  const [bin = '', ...rest] = words
+  if (bin === 'find') return findReadsOnly(rest)
+  if (bin === 'git') {
+    // Nothing between git and its subcommand: -c and -C change what runs.
+    const [sub = '', ...args] = rest
+    const spec = specOf(GIT_SPECS, sub)
+    return spec !== undefined && keepsToSpec(args, spec)
+  }
+  const spec = specOf(SHELL_SPECS, bin)
+  if (spec === undefined) return false
+  return spec === 'any' || keepsToSpec(rest, spec)
+}
+
+const PLAIN_CHAR = /[A-Za-z0-9_./:=,@%+~-]/
+const STDERR_REDIRECTS = ['2>&1', '2>/dev/null', '2> /dev/null']
+
+/**
+ * The simple commands of a command line, each as the words the shell would
+ * pass, quotes removed; null when the line holds anything the lexer does not
+ * read as plain (see the comment above ShellSpec).
+ */
+export function shellSteps(command: string): string[][] | null {
+  const steps: string[][] = []
+  let words: string[] = []
+  let word: string | null = null
+  const endWord = () => {
+    if (word !== null) words.push(word)
+    word = null
+  }
+  const endStep = () => {
+    endWord()
+    if (words.length > 0) steps.push(words)
+    words = []
+  }
+  const isBoundary = (at: number) => at >= command.length || /[\s;&|]/.test(command[at] ?? '')
+
+  let i = 0
+  while (i < command.length) {
+    const c = command[i] ?? ''
+    if (word === null) {
+      const redirect = STDERR_REDIRECTS.find(r => command.startsWith(r, i) && isBoundary(i + r.length))
+      if (redirect !== undefined) {
+        i += redirect.length
+        continue
+      }
+      if (c === '!' && isBoundary(i + 1)) {
+        words.push('!')
+        i += 1
+        continue
+      }
+    }
+    if (c === "'") {
+      const close = command.indexOf("'", i + 1)
+      if (close === -1) return null
+      word = (word ?? '') + command.slice(i + 1, close)
+      i = close + 1
+    } else if (c === '"') {
+      const close = command.indexOf('"', i + 1)
+      if (close === -1) return null
+      const inner = command.slice(i + 1, close)
+      if (/[$`\\]/.test(inner)) return null
+      word = (word ?? '') + inner
+      i = close + 1
+    } else if (c === ' ' || c === '\t') {
+      endWord()
+      i += 1
+    } else if (c === '\n' || c === ';' || c === '|' || c === '&') {
+      // `|`, `||`, `&&`, `&`, `;` and a newline all end a simple command.
+      endStep()
+      i += 1
+    } else if (PLAIN_CHAR.test(c)) {
+      word = (word ?? '') + c
+      i += 1
+    } else {
+      return null
+    }
+  }
+  endStep()
+  return steps
 }
 
 export function isReadOnlyShell(command: string): boolean {
-  const cleaned = command.replace(/\s2>&1/g, '').replace(/\s2>\s*\/dev\/null/g, '')
-  if (/[>`]|\$\(|<\(/.test(cleaned)) return false
-
-  return cleaned
-    .split(/&&|\|\||[;&|\n]/)
-    .map(step => step.trim())
-    .filter(step => step.length > 0)
-    .every(isReadOnlyStep)
+  const steps = shellSteps(command)
+  return steps !== null && steps.length > 0 && steps.every(isReadOnlyStep)
 }
 
 /** Whether a fork this plugin started may make this call: read and look up, never change. */
@@ -163,13 +514,43 @@ async function settle($: EngineInterface) {
   $.ui.status(undefined)
 }
 
-/** Seats a new ask, clearing the last one's analysis and forks; resolves whether the pane is drawn. */
+// How many finished forks of earlier asks stay readable in the panel.
+const KEPT_REPORTS = 10
+const STOPPED = 'Rama detenida: la pregunta cambió antes de que terminara.'
+
+/** Stops a fork whose question is gone, best effort: TaskStop takes a background agent by its id. */
+function stopFork($: EngineInterface, agentId: string) {
+  void $.tool.call({ tool: 'TaskStop', task_id: agentId }).catch(() => undefined)
+}
+
+const isFinished = (fork: DecisionFork) => fork.status === 'done' || fork.status === 'error'
+
+/**
+ * Hands the forks of earlier asks over to a new one: a running fork is
+ * stopped, a finished one stays readable (the latest KEPT_REPORTS of them).
+ */
+async function retireForks($: EngineInterface, askId: string) {
+  const isEarlier = (slot: string) => !slot.startsWith(`${askId}:`)
+  const running = Object.entries(await read($, forks)).filter(([slot, fork]) => isEarlier(slot) && fork.status === 'running')
+  for (const [, fork] of running) if (fork.agentId !== undefined) stopFork($, fork.agentId)
+
+  await update($, forks, all => {
+    const entries = Object.entries(all).map(([slot, fork]): [string, DecisionFork] =>
+      isEarlier(slot) && fork.status === 'running' ? [slot, { ...fork, status: 'error', text: STOPPED }] : [slot, fork],
+    )
+    const finished = entries.filter(([slot, fork]) => isEarlier(slot) && isFinished(fork))
+    const dropped = new Set(finished.slice(0, Math.max(0, finished.length - KEPT_REPORTS)).map(([slot]) => slot))
+    return Object.fromEntries(entries.filter(([slot]) => !dropped.has(slot)))
+  })
+}
+
+/** Seats a new ask, clearing the last one's analysis and retiring its forks; resolves whether the pane is drawn. */
 async function present($: EngineInterface, next: DecisionAsk, isAsked: boolean) {
   await update($, ask, () => next)
   await update($, focus, () => 0)
   await update($, picks, () => ({}))
   await update($, implications, () => ({}))
-  await update($, forks, () => ({}))
+  await retireForks($, next.id)
   await update($, phase, () => 'ready')
   const count = next.questions.length > 1 ? `${next.questions.length} preguntas` : 'una pregunta'
   $.ui.status(`decision-tree: ${count} para explorar · /decision-tree`)
@@ -178,13 +559,19 @@ async function present($: EngineInterface, next: DecisionAsk, isAsked: boolean) 
   // main screen it would open inline, so the status line points to it instead.
   const shouldOpen = isAsked || isFullscreen !== false
   const isPlaced = shouldOpen ? (await $.ui.open({ id: PANE, title: TITLE })).isPlaced : false
-  void imply($, next.id, 0, 0)
+  // A dialog the pane could not take goes back to the native one: nothing to analyse.
+  if (!isAsked || isPlaced) void imply($, next.id, 0, 0)
   return isPlaced
 }
+
+// The main turn that ended last; undefined once the person spoke after it. A
+// question read for any other turn is stale and dropped.
+let latestTurn: string | undefined
 
 async function readQuestion($: EngineInterface, answer: string, turnId: string) {
   await update($, phase, () => 'reading')
   const reply = await $.model.complete({ model: 'haiku', prompt: ASK_PROMPT(answer), maxTokens: 800 })
+  if (latestTurn !== turnId) return
   const found = reply.isAnswered ? parseQuestion(reply.text) : null
 
   if (found === null) {
@@ -201,11 +588,32 @@ async function current($: EngineInterface, id: string) {
   return a !== null && a.id === id ? a : null
 }
 
+// Slots whose analysis or fork is being started: a second press of the same
+// option waits for nothing and starts nothing.
+const implying = new Set<string>()
+const branching = new Set<string>()
+
+const reasonOf = (error: unknown) => (error instanceof Error ? error.message : String(error))
+
+/** Analyses an option once; a failure is shown as such, never left loading. */
 async function imply($: EngineInterface, id: string, qi: number, oi: number) {
+  const slot = slotOf(id, qi, oi)
+  if (implying.has(slot)) return
+  implying.add(slot)
+  try {
+    await analyse($, id, qi, oi, slot)
+  } catch (error) {
+    const failed: DecisionImplication = { status: 'error', text: `No se pudo analizar (${reasonOf(error)}).` }
+    await update($, implications, all => ({ ...all, [slot]: failed })).catch(() => undefined)
+  } finally {
+    implying.delete(slot)
+  }
+}
+
+async function analyse($: EngineInterface, id: string, qi: number, oi: number, slot: string) {
   const a = await current($, id)
   const q = a?.questions[qi]
   const option = q?.options[oi]
-  const slot = slotOf(id, qi, oi)
   if (a === null || q === undefined || option === undefined) return
   if ((await read($, implications))[slot] !== undefined) return
 
@@ -220,17 +628,58 @@ async function imply($: EngineInterface, id: string, qi: number, oi: number) {
   await update($, implications, all => ({ ...all, [slot]: result }))
 }
 
+async function rememberFork($: EngineInterface, agentId: string) {
+  knownForks.add(agentId)
+  await update($, forkIds, ids => (ids.includes(agentId) ? ids : [...ids, agentId]))
+}
+
+/** Whether the agent is a fork this plugin started, its id handed back yet or not. */
+async function isOwnFork($: EngineInterface, agentId: string): Promise<boolean> {
+  if (knownForks.has(agentId)) return true
+  if (foreignAgents.has(agentId)) return false
+  if ((await read($, forkIds)).includes(agentId)) {
+    knownForks.add(agentId)
+    return true
+  }
+  const listed = (await $.agent.list()).find(one => one.id === agentId)
+  if (listed?.spawnedBy === 'decision-tree') {
+    await rememberFork($, agentId)
+    return true
+  }
+  if (listed !== undefined) {
+    foreignAgents.add(agentId)
+    return false
+  }
+  // Listed by nobody yet: while a spawn of this plugin is under way, it may
+  // be that fork. Not remembered either way; the next call asks again.
+  return pendingSpawns > 0
+}
+
+/** Starts one fork for an option; a second press while it starts does nothing. */
 async function branch($: EngineInterface, id: string, qi: number, oi: number) {
+  const slot = slotOf(id, qi, oi)
+  if (branching.has(slot)) return
+  branching.add(slot)
+  try {
+    await startFork($, id, qi, oi, slot)
+  } finally {
+    branching.delete(slot)
+  }
+}
+
+async function startFork($: EngineInterface, id: string, qi: number, oi: number, slot: string) {
   const a = await current($, id)
   const q = a?.questions[qi]
   const option = q?.options[oi]
-  const slot = slotOf(id, qi, oi)
   if (a === null || q === undefined || option === undefined) return
   const existing = (await read($, forks))[slot]
   if (existing !== undefined && existing.status !== 'error') return
 
-  const setFork = (fork: DecisionFork) => update($, forks, all => ({ ...all, [slot]: fork }))
+  const about = { label: option.label, question: q.text }
+  const setFork = (fork: DecisionFork) => update($, forks, all => ({ ...all, [slot]: { ...about, ...fork } }))
   await setFork({ status: 'starting', text: '' })
+  // Held until the id is remembered: the fork may call tools before then.
+  pendingSpawns += 1
   try {
     const spawned = await $.agent.spawn({
       subagentType: 'fork',
@@ -242,10 +691,18 @@ async function branch($: EngineInterface, id: string, qi: number, oi: number) {
       return
     }
     const agentId = spawned.agentId
-    await update($, forkIds, ids => [...ids, agentId].slice(-100))
+    await rememberFork($, agentId)
+    // Its question was replaced while it started: nobody waits for it now.
+    if ((await current($, id)) === null) {
+      stopFork($, agentId)
+      await setFork({ status: 'error', agentId, text: STOPPED })
+      return
+    }
     await setFork({ status: 'running', agentId, text: '' })
   } catch (error) {
     await setFork({ status: 'error', text: `La rama no arrancó: ${String(error)}` })
+  } finally {
+    pendingSpawns -= 1
   }
 }
 
@@ -295,29 +752,37 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     if (e.agentId !== undefined) {
-      const ids = await read($, forkIds)
-      if (ids.includes(e.agentId)) {
-        const agentId = e.agentId
-        const all = await read($, forks)
-        const slot = Object.keys(all).find(key => all[key]?.agentId === agentId)
-        if (slot !== undefined) {
-          const done: DecisionFork =
-            e.reason === 'answer'
-              ? { status: 'done', agentId, text: e.answer }
-              : { status: 'error', agentId, text: `La rama terminó sin respuesta (${e.reason}).` }
+      // A fork's answer is its report, kept with the fork even when its ask is gone.
+      const agentId = e.agentId
+      const all = await read($, forks)
+      const slot = Object.keys(all).find(key => all[key]?.agentId === agentId)
+      const was = slot === undefined ? undefined : all[slot]
+      if (slot !== undefined && was !== undefined) {
+        if (e.reason === 'answer') {
+          const done: DecisionFork = { ...was, status: 'done', agentId, text: e.answer }
           await update($, forks, now => ({ ...now, [slot]: done }))
           $.ui.toast('decision-tree: rama lista, mírala en el panel')
+        } else if (was.status !== 'error') {
+          // One already marked (stopped when its question changed) keeps its line.
+          const failed: DecisionFork = { ...was, status: 'error', agentId, text: `La rama terminó sin respuesta (${e.reason}).` }
+          await update($, forks, now => ({ ...now, [slot]: failed }))
         }
       }
       return next(e)
     }
+
+    // Any reading still under way is for an older turn now.
+    latestTurn = e.turnId
 
     // An AskUserQuestion handed to the panel stays until it is answered.
     const pending = await read($, ask)
     if (pending?.source === 'tool') return next(e)
 
     if (e.reason === 'answer' && endsWithQuestion(e.answer)) {
-      void readQuestion($, e.answer, e.turnId).catch(() => update($, phase, () => 'none'))
+      const turnId = e.turnId
+      void readQuestion($, e.answer, turnId).catch(() =>
+        latestTurn === turnId ? update($, phase, () => 'none') : undefined,
+      )
     }
     return next(e)
   })
@@ -325,35 +790,50 @@ export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     // A fork's completion would otherwise wake the main conversation with its
     // report before the person chose anything; the panel shows it instead.
+    // Dropped only for a fork the panel holds: any other reaches the conversation.
     if (e.origin?.kind === 'task-notification') {
-      const ids = await read($, forkIds)
-      if (ids.some(id => e.text.includes(id))) {
-        return { drop: 'decision-tree: la rama terminó; su informe está en el panel (/decision-tree).' }
-      }
+      const held = Object.values(await read($, forks)).some(
+        fork => fork.agentId !== undefined && e.text.includes(fork.agentId),
+      )
+      if (held) return { drop: 'decision-tree: la rama terminó; su informe está en el panel (/decision-tree).' }
       return next(e)
     }
-    // The person answered on their own: a dialog handed to the panel is settled.
-    if (e.origin === undefined || e.origin.kind === 'composer') {
-      if ((await read($, ask))?.source === 'tool') await settle($)
+    // The person answered on their own (at the prompt, from the phone or as
+    // the SDK host): whatever question the panel holds is settled, and one
+    // still being read is dropped. A slash command is no answer: /decision-tree
+    // is how the person opens the question they are about to answer.
+    const kind = e.origin?.kind
+    const isPerson = kind === undefined || kind === 'composer' || kind === 'bridge' || kind === 'sdk'
+    if (isPerson && !e.text.trimStart().startsWith('/')) {
+      latestTurn = undefined
+      if ((await read($, ask)) !== null || (await read($, phase)) === 'reading') await settle($)
     }
     return next(e)
   })
 
+  const forkDeny = (tool: string) => ({
+    deny: `decision-tree: esta es una rama de prueba; ${tool} no está permitido aquí. Describe el cambio en tu informe en lugar de aplicarlo.`,
+  })
+
   on('tool.call', async ($, e, next) => {
     if (e.agentId === undefined) return next(e)
-    if (!(await read($, forkIds)).includes(e.agentId)) return next(e)
+    if (!(await isOwnFork($, e.agentId))) return next(e)
 
     const tool = String(e.tool)
     if (forkMayCall(tool, { command: 'command' in e ? e.command : undefined })) return next(e)
-
-    return {
-      deny: `decision-tree: esta es una rama de prueba; ${tool} no está permitido aquí. Describe el cambio en tu informe en lugar de aplicarlo.`,
+    return forkDeny(tool)
+  }).catch(($, e, next) => {
+    // Judged from what this module holds: $ may not answer here.
+    if (next.called || e.agentId === undefined || foreignAgents.has(e.agentId)) return next(e)
+    const tool = String(e.tool)
+    if (knownForks.has(e.agentId)) {
+      return forkMayCall(tool, { command: 'command' in e ? e.command : undefined }) ? next(e) : forkDeny(tool)
     }
-  }).catch(($, e, next) =>
-    next.called || e.agentId === undefined
-      ? next(e)
-      : { deny: 'decision-tree: no se pudo comprobar si esta llamada viene de una rama de prueba.' },
-  )
+    if (pendingSpawns > 0) {
+      return { deny: 'decision-tree: no se pudo comprobar si esta llamada viene de una rama de prueba.' }
+    }
+    return next(e)
+  })
 
   // The handed-off dialog's transcript row: a card pointing to the panel in
   // place of the refusal text the model reads.
@@ -395,7 +875,29 @@ export const register: Register = on => {
     const { Box, Text, Button, Markdown } = $.ui.resolve(e)
     const a = await read($, ask)
     const state = await read($, phase)
+    const allForks = await read($, forks)
     const width = e.props.bodyColumns
+
+    // The finished forks of earlier asks, newest first: their reports stay readable.
+    const earlier = Object.entries(allForks)
+      .filter(([slot, f]) => (a === null || !slot.startsWith(`${a.id}:`)) && isFinished(f))
+      .slice(-3)
+      .reverse()
+    const earlierBox =
+      earlier.length === 0 ? null : (
+        <Box flexDirection="column" borderStyle="round" borderColor="subtle" borderDimColor paddingX={1}>
+          <Text dimColor bold>⑂ Ramas anteriores</Text>
+          {earlier.map(([, f], i) => (
+            <Box key={`prev-${i}`} flexDirection="column" marginTop={1}>
+              <Text wrap="wrap">
+                <Text bold>{f.label ?? 'Rama'}</Text>
+                {f.question !== undefined ? <Text dimColor> · {f.question}</Text> : ''}
+              </Text>
+              <Markdown key={`prev-report-${i}`} text={f.text} dimColor={f.status === 'error'} />
+            </Box>
+          ))}
+        </Box>
+      )
 
     const header = (
       <Box flexDirection="row" justifyContent="space-between">
@@ -417,6 +919,7 @@ export const register: Register = on => {
           <Box borderStyle="round" borderColor="subtle" paddingX={1}>
             <Text dimColor wrap="wrap">{message}</Text>
           </Box>
+          {earlierBox}
         </Box>
       )
     }
@@ -429,7 +932,6 @@ export const register: Register = on => {
     const option = q.options[oi]
     const slot = slotOf(a.id, qi, oi)
     const implication = (await read($, implications))[slot]
-    const allForks = await read($, forks)
     const fork = allForks[slot]
 
     const showQuestion = (i: number) => {
@@ -567,6 +1069,8 @@ export const register: Register = on => {
         )}
 
         {custom}
+
+        {earlierBox}
       </Box>
     )
   })

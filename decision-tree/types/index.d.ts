@@ -25,6 +25,9 @@ export type DecisionFork = {
   status: 'starting' | 'running' | 'done' | 'error'
   agentId?: string
   text: string
+  /** The option it tries and the question it answers, to show it once its ask is gone. */
+  label?: string
+  question?: string
 }
 
 declare module 'claude-code' {
@@ -37,6 +40,7 @@ declare module 'claude-code' {
       /** The option picked per question, by the question's index. */
       picks: Record<string, number>
       implications: Record<string, DecisionImplication>
+      /** Every fork by slot (`<ask id>:<question>:<option>`), kept past its ask. */
       forks: Record<string, DecisionFork>
       forkIds: string[]
     }

@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import type { EngineInterface, On } from 'claude-code'
+import type { AgentInfo, EngineInterface, On } from 'claude-code'
 
 import { composeAnswer, forkMayCall, fromToolQuestions, isReadOnlyShell } from '../hooks/register'
 
@@ -11,30 +11,73 @@ const QUESTION = {
   ],
 }
 
+const REDIS_QUESTION = {
+  question: '¿Añado una caché con Redis?',
+  options: [
+    { label: 'Sí', reply: 'Sí, añade Redis.' },
+    { label: 'No', reply: 'No hace falta.' },
+  ],
+}
+
 const PANE = { component: 'Pane', props: { title: 'Decisión' }, requestId: 'decision-tree' } as const
 
 function world(on: On) {
-  const seen = { spawns: [] as string[], submits: [] as string[], completes: 0, opened: 0 }
+  const seen = {
+    spawns: [] as string[],
+    submits: [] as string[],
+    completes: 0,
+    opened: 0,
+    /** What `$.agent.list()` answers. */
+    agents: [] as AgentInfo[],
+    isListFailing: false,
+    /** Holds a spawn until it resolves, as a slow start does. */
+    spawnGate: Promise.resolve(),
+    /** `$.model.fork` calls, the analysis of an option. */
+    forkCalls: 0,
+    forkGate: Promise.resolve(),
+    isForkFailing: false,
+    /** Whether `$.ui.open` places the pane. */
+    isPlaced: true,
+    /** Each reading of a question waits on the next of these, when there is one. */
+    completeGates: [] as Promise<void>[],
+    /** Every tool call that reached the tools. */
+    toolCalls: [] as Record<string, unknown>[],
+  }
+  on('agent.list', () => {
+    if (seen.isListFailing) throw new Error('agent.list failed')
+    return { value: seen.agents } as never
+  })
   on('turn.complete', (_$, e) => ({ text: e.answer }))
   on('ui.status', () => ({ value: undefined }) as never)
-  on('model.complete', () => {
+  on('model.complete', async (_$, e) => {
     seen.completes += 1
-    return { value: { isAnswered: true, text: JSON.stringify(QUESTION), usage: usage() } } as never
+    await (seen.completeGates.shift() ?? Promise.resolve())
+    const question = e.prompt.includes('Redis') ? REDIS_QUESTION : QUESTION
+    return { value: { isAnswered: true, text: JSON.stringify(question), usage: usage() } } as never
   })
-  on('model.fork', () => ({ value: { isAnswered: true, text: '**Qué harías después**: migrar.', usage: usage() } }) as never)
+  on('model.fork', async () => {
+    seen.forkCalls += 1
+    await seen.forkGate
+    if (seen.isForkFailing) throw new Error('model.fork failed')
+    return { value: { isAnswered: true, text: '**Qué harías después**: migrar.', usage: usage() } } as never
+  })
   on('ui.open', () => {
     seen.opened += 1
-    return { value: { isPlaced: true } } as never
+    return { value: { isPlaced: seen.isPlaced } } as never
   })
-  on('agent.spawn', (_$, e) => {
+  on('agent.spawn', async (_$, e) => {
     seen.spawns.push(e.prompt)
+    await seen.spawnGate
     return { model: 'test', agentId: 'fork-1' }
   })
   on('prompt.submit', (_$, e) => {
     seen.submits.push(e.text)
     return { text: e.text }
   })
-  on('tool.call', (_$, e) => ({ ref: e.tool_use_id, result: 'ok', text: 'ok', isError: false }) as never)
+  on('tool.call', (_$, e) => {
+    seen.toolCalls.push(e as unknown as Record<string, unknown>)
+    return { ref: e.tool_use_id, result: 'ok', text: 'ok', isError: false } as never
+  })
   return seen
 }
 
@@ -101,10 +144,8 @@ test('trying an option spawns a fork with its reply; confirming sends it', async
   expect(await ui.find({ type: 'Markdown', text: /La rama no arrancó/ })).toBeDefined()
 
   // Outside a fork this plugin started, the guard lets every call through.
-  const mainWrite = await $.tool.call({ tool: 'Write', tool_use_id: 'w1', file_path: '/x', content: 'y' } as never)
-  expect(mainWrite.isError).toBeFalsy()
-  const otherWrite = await $.tool.call({ tool: 'Write', tool_use_id: 'w2', agentId: 'other', file_path: '/x', content: 'y' } as never)
-  expect(otherWrite.isError).toBeFalsy()
+  expect(await call($, { tool: 'Write', file_path: '/x', content: 'y' })).toBe(null)
+  expect(await call($, { tool: 'Write', agentId: 'other', file_path: '/x', content: 'y' })).toBe(null)
 
   await ui.press({ key: 'send' })
   expect(seen.submits).toContain('Usa SQLite.')
@@ -132,6 +173,145 @@ test('read-only shell check', () => {
   expect(isReadOnlyShell('sort f | uniq -c')).toBe(true)
 })
 
+// Each input below got past the guard once; none may again.
+const SHELL_BYPASSES = [
+  // rg runs a preprocessor or a hostname program of the caller's choosing.
+  'rg --pre rm x .',
+  'rg --pre=rm x .',
+  'rg --pre-glob "*" --pre rm x .',
+  'rg --hostname-bin=sh x .',
+  'rg --pr rm x .',
+  // A quote does not hide a flag.
+  'find . "-delete"',
+  "find . '-exec' rm {} +",
+  "find . '-exec' rm '{}' '+'",
+  "sort '-o' f in",
+  // Attached, bundled and abbreviated output flags.
+  'sort -uo src/index.ts /dev/null',
+  'sort -osrc/x in',
+  'sort --out=f in',
+  'sort --output=f in',
+  'git log --outp=f',
+  'git log --output=f',
+  'tree -ofile',
+  'tree -R -H .',
+  // A bare - is an operand: here it makes path/file the output.
+  'uniq - path/file',
+  'sort --compress-program=sh in',
+  'sort --compress-program sh in',
+  'file -C -m x',
+  'tail -f log',
+  'tail -F log',
+  'tail --follow log',
+  'tail -n5 -f log',
+  // The traditional form follows too: +5f is -n +5 -f.
+  'tail +5f log',
+  'tail +f log',
+  'tail +5F log',
+  'sort --compress-program=sh',
+  'file -C',
+  'date -s 12:00',
+  'date --set=12:00',
+  'date 202610121200',
+  // Expansion, substitution and redirection in any spelling.
+  'echo $HOME',
+  'echo "$(rm -rf x)"',
+  'echo "`rm -rf x`"',
+  "echo 'a' > f",
+  'cat f >> g',
+  'cat < f',
+  'echo hi >| f',
+  'ls \\\n-la',
+  'grep foo f\\;rm x',
+  // A glob can expand to a file named like a flag.
+  'rg foo *',
+  'ls src/*.ts',
+  'find . {-delete,}',
+  'ls [a]',
+  // Separators inside and outside quotes.
+  "grep 'a|b' f; rm x",
+  'ls && rm x',
+  'ls || rm x',
+  'ls\nrm x',
+  'ls & rm x',
+  // Unterminated quotes, prefixes, and unknown binaries.
+  "grep 'foo f",
+  'FOO=1 ls',
+  '/bin/rm x',
+  'command rm x',
+  'xargs rm',
+  'toString',
+  'git constructor',
+  'git -c core.pager=sh log',
+  'git -C .. log',
+  'git log --ext-diff -p',
+  'git diff --output=x',
+  'git branch newname',
+  'git stash',
+  'git checkout .',
+]
+
+test('read-only shell check refuses every known bypass', () => {
+  expect(SHELL_BYPASSES.filter(command => isReadOnlyShell(command))).toEqual([])
+})
+
+// What a fork uses every day must keep working.
+const SHELL_READS = [
+  'ls',
+  'ls -la',
+  'ls -la src',
+  'grep -rn foo src',
+  'grep -rn "foo bar" src',
+  "grep -E 'a|b$' src/x.ts",
+  'grep -rn foo --include=x.ts src',
+  "grep -rn foo --include='*.ts' src",
+  'rg -n foo',
+  "rg -n 'foo\\(' -g '*.ts' src",
+  'rg --files',
+  "find . -name '*.ts' -type f",
+  'find src -maxdepth 2 -type d',
+  "find . -name '*.md' -not -path './node_modules/*'",
+  'git log --oneline',
+  'git log --oneline -5',
+  'git log -n 3 --stat',
+  'git diff --stat',
+  'git diff HEAD~1 -- src/x.ts',
+  'git show HEAD:src/x.ts',
+  'git status --short',
+  'git branch -vv',
+  'git rev-parse --show-toplevel',
+  'head -n 20 f',
+  'head -50 f',
+  'tail -n 20 f',
+  'tail -n +5 f',
+  'wc -l f g',
+  'sort -u f',
+  'sort -rn f',
+  'sort f | uniq -c | sort -rn | head -5',
+  'uniq -c in',
+  "jq '.x' package.json",
+  "jq -r '.scripts | keys[]' package.json",
+  'cat package.json 2>&1',
+  'cat f 2> /dev/null',
+  'pwd',
+  'echo hola',
+  'date +%Y-%m-%d',
+  'date -u',
+  'which node',
+  'tree -L 2 src',
+  'du -sh src',
+  'diff -u a b',
+  'file f',
+  'stat f',
+  'cut -d: -f1 f',
+  "tr -d '\\r'",
+  'basename src/x.ts .ts',
+]
+
+test('read-only shell check keeps the everyday reads', () => {
+  expect(SHELL_READS.filter(command => !isReadOnlyShell(command))).toEqual([])
+})
+
 test('what a fork may call', () => {
   expect(forkMayCall('Read', {})).toBe(true)
   expect(forkMayCall('Grep', {})).toBe(true)
@@ -143,6 +323,111 @@ test('what a fork may call', () => {
   expect(forkMayCall('Agent', {})).toBe(false)
   expect(forkMayCall('AskUserQuestion', {})).toBe(false)
   expect(forkMayCall('mcp__github__create_issue', {})).toBe(false)
+  // A fork may read secrets (.env); a URL would carry them out.
+  expect(forkMayCall('WebFetch', {})).toBe(false)
+  expect(forkMayCall('WebSearch', {})).toBe(false)
+})
+
+const FORK_IDS = { plugin: 'decision-tree', key: 'forkIds' } as const
+
+function agent(id: string, spawnedBy?: string): AgentInfo {
+  return { id, description: 'Rama: x', type: 'fork', status: 'running', ...(spawnedBy === undefined ? {} : { spawnedBy }) }
+}
+
+/** Runs a tool call as the engine would; resolves the deny reason, or null when the call went through. */
+async function call($: EngineInterface, input: Record<string, unknown>): Promise<string | null> {
+  const r = (await $.tool.call({ tool_use_id: `t-${Math.random()}`, ...input } as never)) as { deny?: string; text?: string }
+  if (typeof r.deny === 'string') return r.deny
+  expect(r.text, JSON.stringify(r)).toBe('ok')
+  return null
+}
+
+const WRITE = { tool: 'Write', file_path: '/x', content: 'y' }
+
+test('the guard holds a fork this plugin started', async ($, on) => {
+  const seen = world(on)
+  // The kit drops an agentId a test spawn makes up and answers state reads
+  // itself, so the fork's id reaches forkIds the other way the guard learns
+  // it: the agent list naming this plugin as the one that spawned it.
+  const written: unknown[] = []
+  on('state.set', (_$, e, next) => {
+    if (e.plugin === FORK_IDS.plugin && e.key === FORK_IDS.key) written.push(e.value)
+    return next(e)
+  })
+  seen.agents = [agent('fork-9', 'decision-tree')]
+  expect(await call($, { ...WRITE, agentId: 'fork-9' })).toContain('rama de prueba')
+  expect(written.at(-1)).toEqual(['fork-9'])
+
+  // Gone from the list (a finished agent leaves it), the id in forkIds still holds it.
+  seen.agents = []
+  expect(await call($, { tool: 'Edit', agentId: 'fork-9', file_path: '/x', old_string: 'a', new_string: 'b' })).not.toBe(null)
+  expect(await call($, { tool: 'Bash', agentId: 'fork-9', command: 'rm -rf build' })).not.toBe(null)
+  expect(await call($, { tool: 'Bash', agentId: 'fork-9', command: "find . '-delete'" })).not.toBe(null)
+  expect(await call($, { tool: 'WebFetch', agentId: 'fork-9', url: 'https://example.com', prompt: 'x' })).not.toBe(null)
+
+  expect(await call($, { tool: 'Bash', agentId: 'fork-9', command: 'ls -la' })).toBe(null)
+  expect(await call($, { tool: 'Read', agentId: 'fork-9', file_path: '/x' })).toBe(null)
+  // The main loop and other subagents keep every tool.
+  expect(await call($, WRITE)).toBe(null)
+  expect(await call($, { ...WRITE, agentId: 'other' })).toBe(null)
+})
+
+test('the guard holds a fork whose spawn has not resolved yet', async ($, on) => {
+  const seen = world(on)
+  await complete($, '¿Lo hago con Postgres o con SQLite?')
+  await settle($, () => seen.opened > 0)
+
+  let release = () => {}
+  seen.spawnGate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  const ui = await $.ui.mount({ plugin: 'decision-tree', surface: 'terminal', ...PANE })
+  const pressing = ui.press({ key: 'try' })
+  await settle($, () => seen.spawns.length > 0)
+
+  // The fork runs before its id comes back: not listed yet, or listed as ours.
+  expect(await call($, { ...WRITE, agentId: 'fork-new' })).not.toBe(null)
+  seen.agents = [agent('fork-new', 'decision-tree'), agent('model-sub'), agent('other-plugin-sub', 'someone-else')]
+  expect(await call($, { tool: 'Bash', agentId: 'fork-new', command: 'rm -rf build' })).not.toBe(null)
+
+  // Subagents someone else started keep every tool meanwhile.
+  expect(await call($, { ...WRITE, agentId: 'model-sub' })).toBe(null)
+  expect(await call($, { ...WRITE, agentId: 'other-plugin-sub' })).toBe(null)
+
+  release()
+  await pressing
+  await ui.unmount()
+})
+
+test("the guard holds any fork listed as this plugin's, however old", async ($, on) => {
+  const seen = world(on)
+  seen.agents = [agent('old-fork', 'decision-tree')]
+  expect(await call($, { ...WRITE, agentId: 'old-fork' })).not.toBe(null)
+
+  // With no spawn under way, an agent nobody lists is not this plugin's.
+  expect(await call($, { ...WRITE, agentId: 'workflow-agent' })).toBe(null)
+})
+
+test('when the guard cannot look an agent up, it refuses only while a fork may be starting', async ($, on) => {
+  const seen = world(on)
+  seen.isListFailing = true
+  // No spawn under way: another plugin's or the model's subagent keeps working.
+  expect(await call($, { ...WRITE, agentId: 'model-sub' })).toBe(null)
+
+  await complete($, '¿Lo hago con Postgres o con SQLite?')
+  await settle($, () => seen.opened > 0)
+  let release = () => {}
+  seen.spawnGate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  const ui = await $.ui.mount({ plugin: 'decision-tree', surface: 'terminal', ...PANE })
+  const pressing = ui.press({ key: 'try' })
+  await settle($, () => seen.spawns.length > 0)
+  expect(await call($, { ...WRITE, agentId: 'maybe-the-fork' })).not.toBe(null)
+
+  release()
+  await pressing
+  await ui.unmount()
 })
 
 test('a custom answer joins the options and gets analysed', async ($, on) => {
@@ -247,4 +532,206 @@ test('the handed-off dialog draws as a card, and the panel draws on each surface
     expect(await pane.find({ key: 'send' })).toBeDefined()
     await pane.unmount()
   }
+})
+
+// Waits for a condition read asynchronously, as a drawing's elements are.
+async function until(ready: () => Promise<boolean>) {
+  for (let i = 0; i < 500; i += 1) {
+    if (await ready()) return
+    await new Promise(resolve => setTimeout(resolve, 2))
+  }
+  throw new Error('never happened')
+}
+
+const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+
+function gate() {
+  let release = () => {}
+  const held = new Promise<void>(resolve => {
+    release = resolve
+  })
+  return { held, release }
+}
+
+test('an analysis that fails says so instead of loading forever', async ($, on) => {
+  const seen = world(on)
+  seen.isForkFailing = true
+  await complete($, '¿Lo hago con Postgres o con SQLite?')
+  await settle($, () => seen.forkCalls > 0)
+
+  const ui = await $.ui.mount({ plugin: 'decision-tree', surface: 'terminal', ...PANE })
+  await until(async () => (await ui.find({ type: 'Markdown', key: 'implication' })) !== undefined)
+  expect((await ui.find({ type: 'Markdown', key: 'implication' }))?.text).toContain('No se pudo analizar')
+  expect(await ui.find({ type: 'Text', text: /Analizando/ })).toBe(undefined)
+  await ui.unmount()
+})
+
+test('a double press starts one analysis and one fork', async ($, on) => {
+  const seen = world(on)
+  const analysis = gate()
+  seen.forkGate = analysis.held
+  await complete($, '¿Lo hago con Postgres o con SQLite?')
+  await settle($, () => seen.forkCalls === 1)
+
+  const ui = await $.ui.mount({ plugin: 'decision-tree', surface: 'terminal', ...PANE })
+  const choosing = Promise.all([ui.press({ key: 'opt-1' }), ui.press({ key: 'opt-1' })])
+  await settle($, () => seen.forkCalls >= 2)
+  await pause(20)
+  expect(seen.forkCalls).toBe(2)
+  analysis.release()
+  await choosing
+
+  const start = gate()
+  seen.spawnGate = start.held
+  const trying = Promise.all([ui.press({ key: 'try' }), ui.press({ key: 'try' })])
+  await settle($, () => seen.spawns.length >= 1)
+  await pause(20)
+  expect(seen.spawns.length).toBe(1)
+  start.release()
+  await trying
+  await ui.unmount()
+})
+
+test('a dialog the pane cannot take keeps the native dialog and analyses nothing', async ($, on) => {
+  const seen = world(on)
+  seen.isPlaced = false
+  const asked = await $.tool.call({ tool: 'AskUserQuestion', tool_use_id: 'ask-9', questions: ASKED } as never)
+  expect('deny' in asked && asked.deny !== undefined).toBe(false)
+  await pause(20)
+  expect(seen.forkCalls).toBe(0)
+})
+
+function typed($: EngineInterface, text: string) {
+  return $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } } as never)
+}
+
+test('a closing question is settled when the person answers on their own', async ($, on) => {
+  const seen = world(on)
+  await complete($, '¿Lo hago con Postgres o con SQLite?')
+  await settle($, () => seen.opened > 0)
+
+  await typed($, 'Ninguna, usa DuckDB.')
+  const ui = await $.ui.mount({ plugin: 'decision-tree', surface: 'terminal', ...PANE })
+  expect(await ui.find({ type: 'Text', text: /Sin pregunta pendiente/ })).toBeDefined()
+  expect(await ui.find({ key: 'send' })).toBe(undefined)
+  await ui.unmount()
+})
+
+test('a slash command typed meanwhile, /decision-tree above all, leaves the question in place', async ($, on) => {
+  const seen = world(on)
+  await complete($, '¿Lo hago con Postgres o con SQLite?')
+  await settle($, () => seen.opened > 0)
+
+  await typed($, '/decision-tree')
+  const ui = await $.ui.mount({ plugin: 'decision-tree', surface: 'terminal', ...PANE })
+  expect(await ui.find({ type: 'Text', text: /Postgres o con SQLite/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a question read after the person spoke is dropped', async ($, on) => {
+  const seen = world(on)
+  const reading = gate()
+  seen.completeGates.push(reading.held)
+  await complete($, '¿Lo hago con Postgres o con SQLite?')
+  await settle($, () => seen.completes === 1)
+
+  await typed($, 'Olvídalo, sigue con lo otro.')
+  reading.release()
+  await pause(20)
+  expect(seen.opened).toBe(0)
+  const ui = await $.ui.mount({ plugin: 'decision-tree', surface: 'terminal', ...PANE })
+  expect(await ui.find({ key: 'send' })).toBe(undefined)
+  await ui.unmount()
+})
+
+test('a slow reading of an older turn does not replace the newer question', async ($, on) => {
+  const seen = world(on)
+  const slow = gate()
+  seen.completeGates.push(slow.held)
+  await complete($, 'Antes de seguir: ¿añado una caché con Redis?')
+  await settle($, () => seen.completes === 1)
+  await complete($, '¿Lo hago con Postgres o con SQLite?')
+  await settle($, () => seen.opened > 0)
+
+  slow.release()
+  await pause(20)
+  const ui = await $.ui.mount({ plugin: 'decision-tree', surface: 'terminal', ...PANE })
+  expect(await ui.find({ type: 'Text', text: /Postgres o con SQLite/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Redis/ })).toBe(undefined)
+  await ui.unmount()
+})
+
+const FORKS = { plugin: 'decision-tree', key: 'forks' } as const
+
+// The kit drops the agentId a test spawn makes up, so the panel records the
+// fork as not started; this turns that record into the one a real start
+// writes: running, under the id core would have handed back.
+function forkStarts(on: On, agentId: string) {
+  on('state.set', (_$, e, next) => {
+    if (e.plugin !== FORKS.plugin || e.key !== FORKS.key) return next(e)
+    const all = e.value as Record<string, { status: string; text: string }>
+    const started = Object.fromEntries(
+      Object.entries(all).map(([slot, fork]) =>
+        fork.status === 'error' && fork.text.includes('sin id de agente')
+          ? [slot, { ...fork, status: 'running', agentId, text: '' }]
+          : [slot, fork],
+      ),
+    )
+    return next({ ...e, value: started } as never)
+  })
+}
+
+function notification($: EngineInterface, text: string) {
+  return $.prompt.submit({ text, wait: false, origin: { kind: 'task-notification' } } as never) as Promise<{ drop?: string }>
+}
+
+test("a fork's report stays in the panel after a new question", async ($, on) => {
+  const seen = world(on)
+  forkStarts(on, 'fork-1')
+  await complete($, '¿Lo hago con Postgres o con SQLite?')
+  await settle($, () => seen.opened > 0)
+  const ui = await $.ui.mount({ plugin: 'decision-tree', surface: 'terminal', ...PANE })
+  await ui.press({ key: 'opt-1' })
+  await ui.press({ key: 'try' })
+  expect(await ui.find({ type: 'Text', text: /Trabajando en sólo lectura/ })).toBeDefined()
+
+  await complete($, '**Qué haría**: migrar a SQLite.', 'fork-1')
+  await until(async () => (await ui.find({ type: 'Markdown', key: 'fork', text: /migrar a SQLite/ })) !== undefined)
+  await ui.unmount()
+
+  await complete($, 'Antes de seguir: ¿añado una caché con Redis?')
+  await settle($, () => seen.opened > 1)
+  const later = await $.ui.mount({ plugin: 'decision-tree', surface: 'terminal', ...PANE })
+  expect(await later.find({ type: 'Text', text: /Redis/ })).toBeDefined()
+  expect(await later.find({ type: 'Text', text: /Ramas anteriores/ })).toBeDefined()
+  expect(await later.find({ type: 'Markdown', text: /migrar a SQLite/ })).toBeDefined()
+  await later.unmount()
+
+  // Its notification still stays out of the conversation: the panel has the report.
+  expect((await notification($, '<task-notification>fork-1 completed</task-notification>')).drop).toBeDefined()
+})
+
+test('a running fork is stopped when its question is replaced', async ($, on) => {
+  const seen = world(on)
+  forkStarts(on, 'fork-1')
+  await complete($, '¿Lo hago con Postgres o con SQLite?')
+  await settle($, () => seen.opened > 0)
+  const ui = await $.ui.mount({ plugin: 'decision-tree', surface: 'terminal', ...PANE })
+  await ui.press({ key: 'try' })
+  await ui.unmount()
+
+  await complete($, 'Antes de seguir: ¿añado una caché con Redis?')
+  await settle($, () => seen.opened > 1)
+  await until(async () => seen.toolCalls.some(c => c.tool === 'TaskStop'))
+  expect(seen.toolCalls.find(c => c.tool === 'TaskStop')?.task_id).toBe('fork-1')
+})
+
+test('a notification for a fork the panel holds no report of reaches the conversation', async ($, on) => {
+  const seen = world(on)
+  seen.agents = [agent('fork-9', 'decision-tree')]
+  expect(await call($, { tool: 'Read', agentId: 'fork-9', file_path: '/x' })).toBe(null)
+
+  const text = '<task-notification>fork-9 failed</task-notification>'
+  expect((await notification($, text)).drop).toBe(undefined)
+  expect(seen.submits).toContain(text)
 })
