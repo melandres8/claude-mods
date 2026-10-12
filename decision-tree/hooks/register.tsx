@@ -57,8 +57,9 @@ const FORK_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LSP', 'ToolSearch'])
 // word (`-n5`) or the next word (`-n 5`). Long flags match exactly, never by
 // prefix (GNU and git accept unique prefixes, `--out` for `--output`), and a
 // long flag's value is read only from `--name=value`: the next word is always
-// judged on its own. A letter is listed as taking a value only where it does
-// on both GNU and BSD, so no word the tool reads as a flag escapes the check.
+// judged on its own. A letter is listed as taking a value only where every
+// GNU or BSD tool that knows it takes one (one that lacks it fails), so no
+// word the tool reads as a flag escapes the check.
 
 type ShellSpec = {
   /** Short letters that take no value; any order, bundled. */
