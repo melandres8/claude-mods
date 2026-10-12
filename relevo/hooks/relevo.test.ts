@@ -777,6 +777,28 @@ test('a busy session keeps its role and answers no unknown asker', async ($, on)
   expect((await command($, 'status')).text).toContain('planner ⇄ C · activo · enlazadas')
 })
 
+test('once linked, a stale invite or command cannot re-key the link', async ($, on) => {
+  const sent = linking(on)
+  panes(on)
+  await command($, 'planner B')
+  const mine = askIn(sent)?.nonce ?? ''
+  // The asks crossed: B asked too before A's reached it, then B's person
+  // accepted A's ask, so the ack echoes A's nonce.
+  await $.session.receive({ origin: FROM_RELEVO, text: linkAsk('builder', 'B-id', 'nonce-b') })
+  await $.session.receive({ origin: FROM_RELEVO, text: linkOk('builder', mine) })
+  sent.length = 0
+
+  expect((await command($, 'status')).text).not.toContain('pide enlazar')
+  const pane = await mountPane($, 'terminal')
+  expect(await pane.find({ key: 'accept' })).toBeUndefined()
+  await pane.unmount()
+
+  // The command from the old toast is refused, and the link stays as it was.
+  expect((await command($, 'planner B-id')).text).toContain('/relevo off')
+  expect((await command($, 'status')).text).toContain('planner ⇄ B · activo · enlazadas')
+  expect(sent.length).toBe(0)
+})
+
 test('a handoff that quotes a link line is a handoff, not a link', async ($, on) => {
   const sent = relay(on)
   const nonce = await linkAs($, 'builder', 'A')

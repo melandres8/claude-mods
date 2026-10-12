@@ -341,6 +341,11 @@ async function setRole($: $, verb: RelevoRole, to: string): Promise<string> {
   if (target === self) {
     return 'el peer no puede ser esta misma sesión.'
   }
+  // A live link is changed only on purpose: a command from an old toast
+  // would otherwise reset it under a new nonce the peer does not hold.
+  if ((await read($, role)) !== null && (await read($, link)) === 'linked') {
+    return `ya enlazada con ${await read($, peer)}; /relevo off para cambiar.`
+  }
   const asked = await read($, invite)
   const accepting = asked !== null && asked.id === target && other(asked.from) === verb ? asked : null
   await update($, role, () => verb)
@@ -531,6 +536,8 @@ async function answerLink($: $, text: string): Promise<void> {
     return
   }
   await update($, link, () => 'linked')
+  // An ask that crossed this one is settled now: accepting it would re-key.
+  await update($, invite, () => null)
   const held = (await read($, pending)) === null ? '' : ' /relevo resume envía lo retenido.'
   $.ui.toast(`relevo: ${short(await read($, peer))} aceptó; sesiones enlazadas.${held}`)
 }
@@ -629,6 +636,7 @@ export const register: Register = (on, options) => {
     await update($, lastReceived, () => relayed.body)
     // The nonce proves the peer accepted, even if its ack was lost.
     await update($, link, () => 'linked')
+    await update($, invite, () => null)
     const now = await $.clock.now()
     await update($, lastReceivedAt, () => now)
     const plain = `${header(relayed.round, relayed.from)}\n\n${relayed.body}`

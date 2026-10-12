@@ -52,7 +52,7 @@ Lo mismo sin panel:
    ```
    /relevo builder <id-de-A>
    ```
-   Si B ejecuta la línea antes de que llegue la petición de A, la petición sale de B hacia A, y A la acepta igual, con `/relevo planner <id-de-B>` o con **Aceptar** en su panel.
+   Si B ejecuta la línea antes de que llegue la petición de A, la petición sale de B hacia A, y A la acepta igual, con `/relevo planner <id-de-B>` o con **Aceptar** en su panel. Si las dos peticiones se cruzan, acepta en una sola de las dos sesiones. Al enlazarse, la petición sobrante se descarta. Si las dos aceptan a la vez, las rondas se descartan como no verificadas: ejecuta `/relevo off` en las dos y enlázalas de nuevo desde una.
 3. En A:
    ```
    /relevo goal Añadir paginación al endpoint /users con tests
@@ -68,7 +68,7 @@ Lo mismo sin panel:
 | `/relevo goal <texto>` | Solo en la planificadora: arranca el ciclo. |
 | `/relevo pause` / `resume` | Corta o reanuda el envío automático. `resume` envía el handoff retenido y pasa al modelo la ronda que llegó en pausa. |
 | `/relevo status` | Muestra rol, peer, ronda, último envío, el id de esta sesión (con rol o sin él) y la petición de enlace pendiente, si la hay. |
-| `/relevo off` | Quita el rol. |
+| `/relevo off` | Quita el rol. Una sesión enlazada rechaza `/relevo planner\|builder` hasta que ejecutas `/relevo off`. |
 
 ## Protecciones
 
