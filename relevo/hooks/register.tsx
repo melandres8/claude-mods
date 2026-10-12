@@ -17,6 +17,7 @@ import {
   header,
   linkAsk,
   linkOk,
+  looksLikeHeader,
   looksLikeLink,
   parseHeader,
   parseLink,
@@ -111,7 +112,8 @@ async function deliver($: $, maxRounds: number, written: string): Promise<string
   const body = stripHeader(written)
   const current = await read($, role)
   const to = await read($, peer)
-  if (current === null || to === null) {
+  const secret = await read($, nonce)
+  if (current === null || to === null || secret === null) {
     return 'sin rol'
   }
   const limit = await limitOf($, maxRounds)
@@ -125,7 +127,7 @@ async function deliver($: $, maxRounds: number, written: string): Promise<string
 
   let reason: string | null = null
   try {
-    const sent = await $.session.send({ to: address(to), text: `${header(n, current)}\n\n${body}` })
+    const sent = await $.session.send({ to: address(to), text: `${header(n, current, secret)}\n\n${body}` })
     if (!sent.isDelivered) reason = sent.reason
   } catch (error) {
     reason = error instanceof Error ? error.message : String(error)
@@ -566,23 +568,44 @@ export const register: Register = (on, options) => {
 
       return { consumed: 'relevo: mensaje de enlace' }
     }
+    const current = await read($, role)
+    // Without a role this session follows no relevo prompt: a header is text.
+    if (current === null || !looksLikeHeader(e.text)) {
+      return next(e)
+    }
+    // A round counts only when the linked peer's relevo sent it: relevo-made,
+    // the link's nonce, and the other role. Anything else shaped as one is
+    // dropped, as the role prompt tells the model to act on such a header.
     const relayed = parseHeader(e.text)
-    if (relayed !== null && (await read($, role)) !== null) {
-      await update($, round, () => relayed.round)
-      await update($, lastReceived, () => relayed.body)
-      await update($, turn, () => 'self')
-      // A handoff from the peer proves the link, acked or not.
-      await update($, link, () => 'linked')
-      const now = await $.clock.now()
-      await update($, lastReceivedAt, () => now)
+    const expected = await read($, nonce)
+    if (
+      relayed === null ||
+      !fromRelevo(e.origin) ||
+      expected === null ||
+      relayed.nonce !== expected ||
+      relayed.from !== other(current)
+    ) {
+      $.ui.toast('relevo: descartado un mensaje de ronda no verificado.')
+
+      return { consumed: 'relevo: ronda no verificada' }
     }
 
-    // Only ever passed on: the model reads it as a new turn. Nothing is sent
-    // from here, so a peer's message never goes back out without a turn.
-    return next(e)
+    // Never lowered: a stale or forged low round cannot reset the count.
+    await update($, round, at => Math.max(at, relayed.round))
+    await update($, lastReceived, () => relayed.body)
+    await update($, turn, () => 'self')
+    // The nonce proves the peer accepted, even if its ack was lost.
+    await update($, link, () => 'linked')
+    const now = await $.clock.now()
+    await update($, lastReceivedAt, () => now)
+
+    // Only ever passed on: the model reads it as a new turn, under the plain
+    // header. Nothing is sent from here, so a peer's message never goes back
+    // out without a turn.
+    return next({ ...e, text: `${header(relayed.round, relayed.from)}\n\n${relayed.body}` })
   }).catch(($, e, next) =>
     // Fails closed: a relevo message whose checks threw never reaches the model.
-    looksLikeLink(e.text) ? { consumed: 'relevo: error al leer un mensaje de enlace' } : next(e),
+    looksLikeLink(e.text) || looksLikeHeader(e.text) ? { consumed: 'relevo: error al leer un mensaje' } : next(e),
   )
 
   on('turn.complete', async ($, e, next) => {

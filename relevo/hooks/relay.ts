@@ -1,8 +1,9 @@
 import type { RelevoRole } from '../types'
 
 // Anchored: a delivery's text is its body as the model reads it, with no
-// envelope before it, so a header is one only at the very start.
-const HEADER = /^\s*\[relevo ronda (\d+) · de (planner|builder)\]\s*/
+// envelope before it, so a header is one only at the very start. On the wire
+// it carries the link's nonce; the model reads it, and may copy it, without.
+const HEADER = /^\s*\[relevo ronda (\d+) · de (planner|builder)(?: · ([\w-]+))?\]\s*/
 
 // The last whole block: the last closing tag, and the last opening before it.
 // A tag quoted in code (`<handoff>` in prose, a fenced example) is not one:
@@ -21,8 +22,13 @@ export function extractTag(text: string, tag: 'handoff' | 'done'): string | null
   return body === '' ? null : body
 }
 
-export function header(round: number, from: RelevoRole): string {
-  return `[relevo ronda ${round} · de ${from}]`
+export function header(round: number, from: RelevoRole, nonce?: string): string {
+  return nonce === undefined ? `[relevo ronda ${round} · de ${from}]` : `[relevo ronda ${round} · de ${from} · ${nonce}]`
+}
+
+// Text that starts as a round header does, well formed or not.
+export function looksLikeHeader(text: string): boolean {
+  return /^\s*\[relevo ronda/.test(text)
 }
 
 // The body without a header the model already wrote at its start, nor the
@@ -35,7 +41,7 @@ export function stripHeader(body: string): string {
 
 export function parseHeader(
   text: string,
-): { round: number; from: RelevoRole; body: string } | null {
+): { round: number; from: RelevoRole; nonce: string | null; body: string } | null {
   const match = HEADER.exec(text)
   if (match === null) {
     return null
@@ -44,6 +50,7 @@ export function parseHeader(
   return {
     round: Number(match[1]),
     from: match[2] as RelevoRole,
+    nonce: match[3] ?? null,
     body: text.slice(match[0].length).trim(),
   }
 }
