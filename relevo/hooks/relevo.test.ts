@@ -1,14 +1,17 @@
 import { expect, mock, test } from 'claude-code/testing'
-import type { Engine } from 'claude-code/testing'
+import type { Engine, MockClock } from 'claude-code/testing'
 import type { On, SessionSendInput } from 'claude-code'
 
 import { address, bar, extractTag, header, linkAsk, linkOk, parseHeader, parseLink, preview, sameText, stripHeader } from './relay'
 
 const PRESENTATION = { isFullscreen: false, columns: 120 }
 
+// The clock of the test that runs now, to let unawaited work settle.
+let clock: MockClock | undefined
+
 // What the engine answers beneath the plugin, kept to what relevo calls.
 function engine(on: On, toasts: string[] = []) {
-  mock.clock(on, { now: 1_000 })
+  clock = mock.clock(on, { now: 1_000 })
   on('session.id', () => ({ value: 'self-session' }))
   on('session.messages', () => ({ value: [] }))
   on('ui.status', () => ({ value: undefined }))
@@ -290,6 +293,77 @@ test('a failed send is held, and resume sends it under the same round', async ($
   expect((await command($, 'status')).text).toContain('en pausa')
 
   isUp = true
+  expect((await command($, 'resume')).text).toContain('ronda 1 enviada')
+  expect(sent.map(one => one.text)).toEqual([`${header(1, 'planner', nonce)}\n\npaso 1`])
+})
+
+function prompts(on: On) {
+  const submitted: string[] = []
+  on('prompt.submit', ($, e) => {
+    submitted.push(e.text)
+
+    return { text: e.text }
+  })
+
+  return submitted
+}
+
+test('a round received while paused waits for resume, no model turn before', async ($, on) => {
+  const toasts: string[] = []
+  const sent = relay(on, toasts)
+  const submitted = prompts(on)
+  const nonce = await linkAs($, 'builder', 'A')
+  await command($, 'pause')
+  const passed = await $.session.receive({ origin: FROM_RELEVO, text: `${header(1, 'planner', nonce)}\n\npaso 1` })
+
+  expect(passed.consumed).toBeDefined()
+  expect(submitted).toEqual([])
+  expect(toasts.at(-1)).toContain('en pausa')
+  expect((await command($, 'status')).text).toContain('ronda 1/')
+  expect((await command($, 'status')).text).toContain('ronda recibida en pausa')
+
+  await command($, 'resume')
+  await clock?.settle()
+  expect(submitted).toEqual(['[relevo ronda 1 · de planner]\n\npaso 1'])
+  await turn($, '<handoff>hecho 1</handoff>')
+  expect(sent.map(one => one.text)).toEqual([`${header(1, 'builder', nonce)}\n\nhecho 1`])
+})
+
+test('/relevo goal hands the objective to the model', async ($, on) => {
+  relay(on)
+  const submitted = prompts(on)
+  await linkAs($, 'planner', 'B')
+  expect((await command($, 'goal Añadir paginación')).text).toContain('objetivo recibido')
+  await clock?.settle()
+
+  expect(submitted).toEqual(['Objetivo de relevo:\n\nAñadir paginación'])
+})
+
+test('a report received after <done> is held, not a new turn', async ($, on) => {
+  const sent = relay(on)
+  const submitted = prompts(on)
+  const nonce = await linkAs($, 'planner', 'B')
+  await turn($, '<handoff>paso 1</handoff>')
+  await turn($, '<done>listo</done>')
+  const passed = await $.session.receive({ origin: FROM_RELEVO, text: `${header(1, 'builder', nonce)}\n\ntarde` })
+
+  expect(passed.consumed).toBeDefined()
+  expect(submitted).toEqual([])
+  expect(sent.length).toBe(1)
+  expect((await command($, 'status')).text).toContain('terminado')
+})
+
+test('a handoff written while paused stays pending until resume', async ($, on) => {
+  const sent = relay(on)
+  panes(on)
+  const nonce = await linkAs($, 'planner', 'B')
+  await command($, 'pause')
+  await turn($, '<handoff>paso 1</handoff>')
+  expect(sent.length).toBe(0)
+  const pane = await mountPane($, 'terminal')
+  expect(await pane.find({ type: 'Text', text: /retenido/ })).toBeDefined()
+  await pane.unmount()
+
   expect((await command($, 'resume')).text).toContain('ronda 1 enviada')
   expect(sent.map(one => one.text)).toEqual([`${header(1, 'planner', nonce)}\n\npaso 1`])
 })

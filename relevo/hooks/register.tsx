@@ -43,6 +43,7 @@ const link = atom({ plugin: 'relevo', key: 'link' } as const, 'none')
 const lastError = atom({ plugin: 'relevo', key: 'lastError' } as const, null)
 const nonce = atom({ plugin: 'relevo', key: 'nonce' } as const, null)
 const invite = atom({ plugin: 'relevo', key: 'invite' } as const, null)
+const inbox = atom({ plugin: 'relevo', key: 'inbox' } as const, null)
 // What the pane's fields hold until the person presses a button.
 const draftRole = atom({ plugin: 'relevo', key: 'draftRole' } as const, 'planner')
 const draftPeer = atom({ plugin: 'relevo', key: 'draftPeer' } as const, null)
@@ -167,6 +168,7 @@ async function reset($: $) {
   await update($, isDone, () => false)
   await update($, lastSent, () => null)
   await update($, pending, () => null)
+  await update($, inbox, () => null)
   await update($, lastHandoffAt, () => null)
   await update($, lastError, () => null)
   await update($, turn, () => null)
@@ -368,6 +370,12 @@ async function setRole($: $, verb: RelevoRole, to: string): Promise<string> {
     : `esta sesión es ${verb.toUpperCase()} ⇄ ${target}. No se pudo enviar el enlace.\nEn la otra sesión: ${manual}`
 }
 
+// A command.run hook may not submit: the submit would wait on the turn the
+// hook holds. A timer's callback runs once the command has ended.
+function submitLater($: $, text: string) {
+  $.clock.after(0, () => void $.prompt.submit({ text }))
+}
+
 async function startGoal($: $, maxRounds: number, text: string): Promise<string> {
   if ((await read($, role)) !== 'planner') {
     return '/relevo goal solo funciona en la planificadora (/relevo planner <peer>).'
@@ -378,8 +386,7 @@ async function startGoal($: $, maxRounds: number, text: string): Promise<string>
   await reset($)
   await update($, goal, () => text)
   await update($, turn, () => 'self')
-  // Not awaited: it resolves when the turn starts, after this command ends.
-  void $.prompt.submit({ text: `Objetivo de relevo:\n\n${text}` })
+  submitLater($, `Objetivo de relevo:\n\n${text}`)
 
   return `objetivo recibido, planificando (máximo ${maxRounds} rondas).`
 }
@@ -407,8 +414,17 @@ async function resumeRelay($: $, maxRounds: number): Promise<string> {
   }
   const held = await read($, pending)
   const outcome = held === null ? '' : ` Pendiente: ${await deliver($, maxRounds, held)}.`
+  // The peer's round that came in during the pause, now a turn for the model.
+  const waiting = await read($, inbox)
+  let handed = ''
+  if (waiting !== null && !(await read($, paused))) {
+    await update($, inbox, () => null)
+    await update($, turn, () => 'self')
+    submitLater($, waiting)
+    handed = ' Ronda recibida pasada al modelo.'
+  }
 
-  return `reanudado (límite ${await limitOf($, maxRounds)} rondas).${outcome}`
+  return `reanudado (límite ${await limitOf($, maxRounds)} rondas).${outcome}${handed}`
 }
 
 async function turnOff($: $): Promise<string> {
@@ -422,6 +438,8 @@ async function turnOff($: $): Promise<string> {
   await update($, lastError, () => null)
   await update($, nonce, () => null)
   await update($, invite, () => null)
+  await update($, inbox, () => null)
+  await update($, pending, () => null)
   $.ui.status(undefined)
 
   return 'rol quitado; no se envía nada más.'
@@ -454,6 +472,7 @@ async function statusText($: $, maxRounds: number): Promise<string> {
     `${current} ⇄ ${await read($, peer)} · ${state} · ${linked}`,
     `ronda ${await read($, round)}/${await limitOf($, maxRounds)} · último envío ${when}`,
     sent === null ? 'último mensaje: (ninguno)' : `último mensaje:\n${sent}`,
+    ...((await read($, inbox)) === null ? [] : ['ronda recibida en pausa: /relevo resume se la pasa al modelo.']),
     ...(asked === null ? [] : [asked]),
   ].join('\n')
 }
@@ -603,16 +622,27 @@ export const register: Register = (on, options) => {
     // Never lowered: a stale or forged low round cannot reset the count.
     await update($, round, at => Math.max(at, relayed.round))
     await update($, lastReceived, () => relayed.body)
-    await update($, turn, () => 'self')
     // The nonce proves the peer accepted, even if its ack was lost.
     await update($, link, () => 'linked')
     const now = await $.clock.now()
     await update($, lastReceivedAt, () => now)
+    const plain = `${header(relayed.round, relayed.from)}\n\n${relayed.body}`
+
+    // Paused or done: no model turn until the person resumes.
+    if ((await read($, paused)) || (await read($, isDone))) {
+      await update($, inbox, () => plain)
+      $.ui.toast(
+        `relevo: llegó la ronda ${relayed.round} de ${short(await read($, peer))} en pausa; /relevo resume se la pasa al modelo.`,
+      )
+
+      return { consumed: 'relevo: ronda retenida en pausa' }
+    }
+    await update($, turn, () => 'self')
 
     // Only ever passed on: the model reads it as a new turn, under the plain
     // header. Nothing is sent from here, so a peer's message never goes back
     // out without a turn.
-    return next({ ...e, text: `${header(relayed.round, relayed.from)}\n\n${relayed.body}` })
+    return next({ ...e, text: plain })
   }).catch(($, e, next) =>
     // Fails closed: a relevo message whose checks threw never reaches the model.
     looksLikeLink(e.text) || looksLikeHeader(e.text) ? { consumed: 'relevo: error al leer un mensaje' } : next(e),

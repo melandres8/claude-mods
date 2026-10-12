@@ -34,6 +34,9 @@ declare module 'claude-code' {
       // The link's shared secret: the asker makes it, the ack echoes it.
       nonce: string | null
       invite: RelevoInvite | null
+      // A round the peer sent while paused or done, as the model will read it;
+      // /relevo resume hands it to the model.
+      inbox: string | null
       draftRole: RelevoRole
       draftPeer: string | null
       draftGoal: string
