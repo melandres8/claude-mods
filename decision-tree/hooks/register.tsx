@@ -505,13 +505,43 @@ async function settle($: EngineInterface) {
   $.ui.status(undefined)
 }
 
-/** Seats a new ask, clearing the last one's analysis and forks; resolves whether the pane is drawn. */
+// How many finished forks of earlier asks stay readable in the panel.
+const KEPT_REPORTS = 10
+const STOPPED = 'Rama detenida: la pregunta cambió antes de que terminara.'
+
+/** Stops a fork whose question is gone, best effort: TaskStop takes a background agent by its id. */
+function stopFork($: EngineInterface, agentId: string) {
+  void $.tool.call({ tool: 'TaskStop', task_id: agentId }).catch(() => undefined)
+}
+
+const isFinished = (fork: DecisionFork) => fork.status === 'done' || fork.status === 'error'
+
+/**
+ * Hands the forks of earlier asks over to a new one: a running fork is
+ * stopped, a finished one stays readable (the latest KEPT_REPORTS of them).
+ */
+async function retireForks($: EngineInterface, askId: string) {
+  const isEarlier = (slot: string) => !slot.startsWith(`${askId}:`)
+  const running = Object.entries(await read($, forks)).filter(([slot, fork]) => isEarlier(slot) && fork.status === 'running')
+  for (const [, fork] of running) if (fork.agentId !== undefined) stopFork($, fork.agentId)
+
+  await update($, forks, all => {
+    const entries = Object.entries(all).map(([slot, fork]): [string, DecisionFork] =>
+      isEarlier(slot) && fork.status === 'running' ? [slot, { ...fork, status: 'error', text: STOPPED }] : [slot, fork],
+    )
+    const finished = entries.filter(([slot, fork]) => isEarlier(slot) && isFinished(fork))
+    const dropped = new Set(finished.slice(0, Math.max(0, finished.length - KEPT_REPORTS)).map(([slot]) => slot))
+    return Object.fromEntries(entries.filter(([slot]) => !dropped.has(slot)))
+  })
+}
+
+/** Seats a new ask, clearing the last one's analysis and retiring its forks; resolves whether the pane is drawn. */
 async function present($: EngineInterface, next: DecisionAsk, isAsked: boolean) {
   await update($, ask, () => next)
   await update($, focus, () => 0)
   await update($, picks, () => ({}))
   await update($, implications, () => ({}))
-  await update($, forks, () => ({}))
+  await retireForks($, next.id)
   await update($, phase, () => 'ready')
   const count = next.questions.length > 1 ? `${next.questions.length} preguntas` : 'una pregunta'
   $.ui.status(`decision-tree: ${count} para explorar · /decision-tree`)
@@ -636,7 +666,8 @@ async function startFork($: EngineInterface, id: string, qi: number, oi: number,
   const existing = (await read($, forks))[slot]
   if (existing !== undefined && existing.status !== 'error') return
 
-  const setFork = (fork: DecisionFork) => update($, forks, all => ({ ...all, [slot]: fork }))
+  const about = { label: option.label, question: q.text }
+  const setFork = (fork: DecisionFork) => update($, forks, all => ({ ...all, [slot]: { ...about, ...fork } }))
   await setFork({ status: 'starting', text: '' })
   // Held until the id is remembered: the fork may call tools before then.
   pendingSpawns += 1
@@ -652,6 +683,12 @@ async function startFork($: EngineInterface, id: string, qi: number, oi: number,
     }
     const agentId = spawned.agentId
     await rememberFork($, agentId)
+    // Its question was replaced while it started: nobody waits for it now.
+    if ((await current($, id)) === null) {
+      stopFork($, agentId)
+      await setFork({ status: 'error', agentId, text: STOPPED })
+      return
+    }
     await setFork({ status: 'running', agentId, text: '' })
   } catch (error) {
     await setFork({ status: 'error', text: `La rama no arrancó: ${String(error)}` })
@@ -706,18 +743,20 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     if (e.agentId !== undefined) {
-      const ids = await read($, forkIds)
-      if (ids.includes(e.agentId)) {
-        const agentId = e.agentId
-        const all = await read($, forks)
-        const slot = Object.keys(all).find(key => all[key]?.agentId === agentId)
-        if (slot !== undefined) {
-          const done: DecisionFork =
-            e.reason === 'answer'
-              ? { status: 'done', agentId, text: e.answer }
-              : { status: 'error', agentId, text: `La rama terminó sin respuesta (${e.reason}).` }
+      // A fork's answer is its report, kept with the fork even when its ask is gone.
+      const agentId = e.agentId
+      const all = await read($, forks)
+      const slot = Object.keys(all).find(key => all[key]?.agentId === agentId)
+      const was = slot === undefined ? undefined : all[slot]
+      if (slot !== undefined && was !== undefined) {
+        if (e.reason === 'answer') {
+          const done: DecisionFork = { ...was, status: 'done', agentId, text: e.answer }
           await update($, forks, now => ({ ...now, [slot]: done }))
           $.ui.toast('decision-tree: rama lista, mírala en el panel')
+        } else if (was.status !== 'error') {
+          // One already marked (stopped when its question changed) keeps its line.
+          const failed: DecisionFork = { ...was, status: 'error', agentId, text: `La rama terminó sin respuesta (${e.reason}).` }
+          await update($, forks, now => ({ ...now, [slot]: failed }))
         }
       }
       return next(e)
@@ -742,11 +781,12 @@ export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     // A fork's completion would otherwise wake the main conversation with its
     // report before the person chose anything; the panel shows it instead.
+    // Dropped only for a fork the panel holds: any other reaches the conversation.
     if (e.origin?.kind === 'task-notification') {
-      const ids = await read($, forkIds)
-      if (ids.some(id => e.text.includes(id))) {
-        return { drop: 'decision-tree: la rama terminó; su informe está en el panel (/decision-tree).' }
-      }
+      const held = Object.values(await read($, forks)).some(
+        fork => fork.agentId !== undefined && e.text.includes(fork.agentId),
+      )
+      if (held) return { drop: 'decision-tree: la rama terminó; su informe está en el panel (/decision-tree).' }
       return next(e)
     }
     // The person answered on their own (at the prompt, from the phone or as
@@ -824,7 +864,29 @@ export const register: Register = on => {
     const { Box, Text, Button, Markdown } = $.ui.resolve(e)
     const a = await read($, ask)
     const state = await read($, phase)
+    const allForks = await read($, forks)
     const width = e.props.bodyColumns
+
+    // The finished forks of earlier asks, newest first: their reports stay readable.
+    const earlier = Object.entries(allForks)
+      .filter(([slot, f]) => (a === null || !slot.startsWith(`${a.id}:`)) && isFinished(f))
+      .slice(-3)
+      .reverse()
+    const earlierBox =
+      earlier.length === 0 ? null : (
+        <Box flexDirection="column" borderStyle="round" borderColor="subtle" borderDimColor paddingX={1}>
+          <Text dimColor bold>⑂ Ramas anteriores</Text>
+          {earlier.map(([, f], i) => (
+            <Box key={`prev-${i}`} flexDirection="column" marginTop={1}>
+              <Text wrap="wrap">
+                <Text bold>{f.label ?? 'Rama'}</Text>
+                {f.question !== undefined ? <Text dimColor> · {f.question}</Text> : ''}
+              </Text>
+              <Markdown key={`prev-report-${i}`} text={f.text} dimColor={f.status === 'error'} />
+            </Box>
+          ))}
+        </Box>
+      )
 
     const header = (
       <Box flexDirection="row" justifyContent="space-between">
@@ -846,6 +908,7 @@ export const register: Register = on => {
           <Box borderStyle="round" borderColor="subtle" paddingX={1}>
             <Text dimColor wrap="wrap">{message}</Text>
           </Box>
+          {earlierBox}
         </Box>
       )
     }
@@ -858,7 +921,6 @@ export const register: Register = on => {
     const option = q.options[oi]
     const slot = slotOf(a.id, qi, oi)
     const implication = (await read($, implications))[slot]
-    const allForks = await read($, forks)
     const fork = allForks[slot]
 
     const showQuestion = (i: number) => {
@@ -996,6 +1058,8 @@ export const register: Register = on => {
         )}
 
         {custom}
+
+        {earlierBox}
       </Box>
     )
   })

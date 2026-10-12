@@ -40,6 +40,8 @@ function world(on: On) {
     isPlaced: true,
     /** Each reading of a question waits on the next of these, when there is one. */
     completeGates: [] as Promise<void>[],
+    /** Every tool call that reached the tools. */
+    toolCalls: [] as Record<string, unknown>[],
   }
   on('agent.list', () => {
     if (seen.isListFailing) throw new Error('agent.list failed')
@@ -72,7 +74,10 @@ function world(on: On) {
     seen.submits.push(e.text)
     return { text: e.text }
   })
-  on('tool.call', (_$, e) => ({ ref: e.tool_use_id, result: 'ok', text: 'ok', isError: false }) as never)
+  on('tool.call', (_$, e) => {
+    seen.toolCalls.push(e as unknown as Record<string, unknown>)
+    return { ref: e.tool_use_id, result: 'ok', text: 'ok', isError: false } as never
+  })
   return seen
 }
 
@@ -636,4 +641,79 @@ test('a slow reading of an older turn does not replace the newer question', asyn
   expect(await ui.find({ type: 'Text', text: /Postgres o con SQLite/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /Redis/ })).toBe(undefined)
   await ui.unmount()
+})
+
+const FORKS = { plugin: 'decision-tree', key: 'forks' } as const
+
+// The kit drops the agentId a test spawn makes up, so the panel records the
+// fork as not started; this turns that record into the one a real start
+// writes: running, under the id core would have handed back.
+function forkStarts(on: On, agentId: string) {
+  on('state.set', (_$, e, next) => {
+    if (e.plugin !== FORKS.plugin || e.key !== FORKS.key) return next(e)
+    const all = e.value as Record<string, { status: string; text: string }>
+    const started = Object.fromEntries(
+      Object.entries(all).map(([slot, fork]) =>
+        fork.status === 'error' && fork.text.includes('sin id de agente')
+          ? [slot, { ...fork, status: 'running', agentId, text: '' }]
+          : [slot, fork],
+      ),
+    )
+    return next({ ...e, value: started } as never)
+  })
+}
+
+function notification($: EngineInterface, text: string) {
+  return $.prompt.submit({ text, wait: false, origin: { kind: 'task-notification' } } as never) as Promise<{ drop?: string }>
+}
+
+test("a fork's report stays in the panel after a new question", async ($, on) => {
+  const seen = world(on)
+  forkStarts(on, 'fork-1')
+  await complete($, '¿Lo hago con Postgres o con SQLite?')
+  await settle($, () => seen.opened > 0)
+  const ui = await $.ui.mount({ plugin: 'decision-tree', surface: 'terminal', ...PANE })
+  await ui.press({ key: 'opt-1' })
+  await ui.press({ key: 'try' })
+  expect(await ui.find({ type: 'Text', text: /Trabajando en sólo lectura/ })).toBeDefined()
+
+  await complete($, '**Qué haría**: migrar a SQLite.', 'fork-1')
+  await until(async () => (await ui.find({ type: 'Markdown', key: 'fork', text: /migrar a SQLite/ })) !== undefined)
+  await ui.unmount()
+
+  await complete($, 'Antes de seguir: ¿añado una caché con Redis?')
+  await settle($, () => seen.opened > 1)
+  const later = await $.ui.mount({ plugin: 'decision-tree', surface: 'terminal', ...PANE })
+  expect(await later.find({ type: 'Text', text: /Redis/ })).toBeDefined()
+  expect(await later.find({ type: 'Text', text: /Ramas anteriores/ })).toBeDefined()
+  expect(await later.find({ type: 'Markdown', text: /migrar a SQLite/ })).toBeDefined()
+  await later.unmount()
+
+  // Its notification still stays out of the conversation: the panel has the report.
+  expect((await notification($, '<task-notification>fork-1 completed</task-notification>')).drop).toBeDefined()
+})
+
+test('a running fork is stopped when its question is replaced', async ($, on) => {
+  const seen = world(on)
+  forkStarts(on, 'fork-1')
+  await complete($, '¿Lo hago con Postgres o con SQLite?')
+  await settle($, () => seen.opened > 0)
+  const ui = await $.ui.mount({ plugin: 'decision-tree', surface: 'terminal', ...PANE })
+  await ui.press({ key: 'try' })
+  await ui.unmount()
+
+  await complete($, 'Antes de seguir: ¿añado una caché con Redis?')
+  await settle($, () => seen.opened > 1)
+  await until(async () => seen.toolCalls.some(c => c.tool === 'TaskStop'))
+  expect(seen.toolCalls.find(c => c.tool === 'TaskStop')?.task_id).toBe('fork-1')
+})
+
+test('a notification for a fork the panel holds no report of reaches the conversation', async ($, on) => {
+  const seen = world(on)
+  seen.agents = [agent('fork-9', 'decision-tree')]
+  expect(await call($, { tool: 'Read', agentId: 'fork-9', file_path: '/x' })).toBe(null)
+
+  const text = '<task-notification>fork-9 failed</task-notification>'
+  expect((await notification($, text)).drop).toBe(undefined)
+  expect(seen.submits).toContain(text)
 })
