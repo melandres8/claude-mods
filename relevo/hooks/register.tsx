@@ -78,7 +78,7 @@ const USAGE = [
   '/relevo builder <peer>   esta sesión construye',
   '/relevo goal <texto>     (planner) arranca el ciclo',
   '/relevo pause | resume   corta o reanuda el envío automático',
-  '/relevo status           rol, peer, ronda y último envío',
+  '/relevo status           rol, peer, ronda, último envío e id de esta sesión',
   '/relevo off              quita el rol',
 ].join('\n')
 
