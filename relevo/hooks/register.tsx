@@ -6,6 +6,7 @@ import type {
   Register,
   SessionReceiveOrigin,
   TextProps,
+  Timer,
 } from 'claude-code'
 
 import type { RelevoLink, RelevoPeer, RelevoRole, RelevoTurn } from '../types'
@@ -469,7 +470,7 @@ async function statusText($: $, maxRounds: number): Promise<string> {
   ]
 
   return [
-    `${current} ⇄ ${await read($, peer)} · ${state} · ${linked}`,
+    `${current} ⇄ ${await read($, peer)} · ${state} · ${linked} · Esta sesión: ${await $.session.id()}`,
     `ronda ${await read($, round)}/${await limitOf($, maxRounds)} · último envío ${when}`,
     sent === null ? 'último mensaje: (ninguno)' : `último mensaje:\n${sent}`,
     ...((await read($, inbox)) === null ? [] : ['ronda recibida en pausa: /relevo resume se la pasa al modelo.']),
@@ -536,6 +537,7 @@ async function answerLink($: $, text: string): Promise<void> {
 
 export const register: Register = (on, options) => {
   const maxRounds = Math.max(1, Number(options.maxRounds ?? 10))
+  let ticker: Timer | undefined
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'relevo',
@@ -543,8 +545,10 @@ export const register: Register = (on, options) => {
       argumentHint: 'planner|builder <peer> · goal <texto> · pause · resume · status · off',
     })
     await showStatus($)
-    // Keeps "hace 12s" moving while a relay is set up.
-    $.clock.every(1000, () => {
+    // Keeps "hace 12s" moving while a relay is set up. One timer per load:
+    // a later session.start replaces it rather than adding another.
+    ticker?.cancel()
+    ticker = $.clock.every(1000, () => {
       void read($, role).then(current => {
         if (current !== null) $.ui.invalidate('ui.render')
       })
@@ -554,11 +558,12 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'relevo' }, async ($, e) => {
-    const [verb = '', ...rest] = e.args.trim().split(/\s+/)
+    const [verb = ''] = e.args.trim().split(/\s+/)
     const arg = e.args.trim().slice(verb.length).trim()
 
     if (verb === 'planner' || verb === 'builder') {
-      if (arg === '' || rest.length !== 1) {
+      // The rest is the peer whole: a name two sessions share is "name [ref]".
+      if (arg === '') {
         return { text: `Uso: /relevo ${verb} <peer>` }
       }
 

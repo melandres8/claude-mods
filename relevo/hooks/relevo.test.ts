@@ -368,6 +368,42 @@ test('a handoff written while paused stays pending until resume', async ($, on) 
   expect(sent.map(one => one.text)).toEqual([`${header(1, 'planner', nonce)}\n\npaso 1`])
 })
 
+test('/relevo status always shows this session’s id', async ($, on) => {
+  relay(on)
+  expect((await command($, 'status')).text).toContain('Esta sesión: self-session')
+  await linkAs($, 'planner', 'B')
+  expect((await command($, 'status')).text).toContain('Esta sesión: self-session')
+})
+
+test('the command takes a "name [ref]" peer, as the pane does', async ($, on) => {
+  relay(on)
+  expect((await command($, 'planner repo [ccc333]')).text).toContain('PLANNER ⇄ repo [ccc333]')
+  expect((await command($, 'status')).text).toContain('planner ⇄ repo [ccc333] · activo')
+  expect((await command($, 'builder')).text).toBe('Uso: /relevo builder <peer>')
+})
+
+test('a second session.start does not pile up another timer', async ($, on) => {
+  relay(on)
+  let ticks = 0
+  on('ui.invalidate', () => {
+    ticks += 1
+
+    return { value: undefined }
+  })
+  on('command.register', () => ({ value: undefined }))
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  const start = { cwd: '/tmp/x', surface: 'terminal', isInteractive: true } as const
+  await $.session.start(start)
+  await $.session.start(start)
+  await $.session.start(start)
+  await linkAs($, 'planner', 'B')
+  ticks = 0
+  await clock?.advance(1000)
+  await clock?.settle()
+
+  expect(ticks).toBe(1)
+})
+
 test('a refused delivery pauses the relay', async ($, on) => {
   const toasts: string[] = []
   engine(on, toasts)
