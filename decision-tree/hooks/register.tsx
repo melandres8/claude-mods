@@ -800,9 +800,11 @@ export const register: Register = on => {
     }
     // The person answered on their own (at the prompt, from the phone or as
     // the SDK host): whatever question the panel holds is settled, and one
-    // still being read is dropped.
+    // still being read is dropped. A slash command is no answer: /decision-tree
+    // is how the person opens the question they are about to answer.
     const kind = e.origin?.kind
-    if (kind === undefined || kind === 'composer' || kind === 'bridge' || kind === 'sdk') {
+    const isPerson = kind === undefined || kind === 'composer' || kind === 'bridge' || kind === 'sdk'
+    if (isPerson && !e.text.trimStart().startsWith('/')) {
       latestTurn = undefined
       if ((await read($, ask)) !== null || (await read($, phase)) === 'reading') await settle($)
     }

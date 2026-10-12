@@ -35,7 +35,7 @@ No hay que hacer nada para que funcione: decision-tree escucha cada turno.
 
 **Ramas anteriores**: cuando llega una pregunta nueva, los informes de las ramas ya terminadas siguen en el panel, bajo «Ramas anteriores». Se muestran los tres últimos y se guardan los diez últimos.
 
-Si respondes por tu cuenta, escribiendo en el prompt, desde el móvil o desde el SDK, la pregunta del panel se da por respondida y desaparece. Así **Confirmar** nunca envía una respuesta pasada.
+Si respondes por tu cuenta, escribiendo en el prompt, desde el móvil o desde el SDK, la pregunta del panel se da por respondida y desaparece. Así **Confirmar** nunca envía una respuesta pasada. Un comando con `/`, como `/decision-tree`, no cuenta como respuesta.
 
 ## Qué puede hacer una rama
 
@@ -47,7 +47,7 @@ Una rama es un fork de la sesión: hereda la conversación y el modo de permisos
 | --- | --- |
 | `Read`, `Grep`, `Glob`, `LSP`, `ToolSearch` y `Bash` sólo con los comandos de abajo | Todas las demás: `Write`, `Edit`, `NotebookEdit`, `Agent`, `AskUserQuestion`, cualquier herramienta MCP y también **`WebFetch` y `WebSearch`** |
 
-Por qué no hay red: una rama puede leer secretos, como un `.env`. Una URL o una búsqueda los sacaría fuera.
+Por qué no hay herramientas de red: una rama puede leer secretos, como un `.env`. Una URL o una búsqueda los sacaría fuera. Esto cierra las herramientas que salen a la red, no todo canal posible: mira las Notas.
 
 ### Bash
 
@@ -131,6 +131,8 @@ Ejemplos que funcionan: `ls -la`, `grep -rn foo src`, `rg -n foo -g '*.ts'`, `fi
 ## Notas
 
 - `git diff`, `git log -p` y `git show` pueden ejecutar programas que **tú** configuraste en git, como `diff.external`, `textconv` o filtros. La rama no puede cambiar esa configuración, pero hereda la tuya.
+- `git status` y `git describe --dirty` pueden reescribir la caché de `.git/index`. No cambian archivos ni historia.
+- En macOS, leer una ruta bajo `/net/<host>` hace que el automontador resuelva ese nombre. Una consulta DNS puede sacar datos aunque la rama no tenga herramientas de red. Pasa con el shell y también con `Read`, `Grep` y `Glob`.
 - `TaskStop` pasa por la comprobación de permisos como cualquier herramienta. Si tu configuración la pide, puede aparecer un diálogo al cambiar de pregunta.
 - El estado (pregunta, opciones, análisis, ramas e ids) vive en `$.state`, así que aguanta una recarga en caliente. Los arranques en curso y las lecturas en curso viven en memoria del módulo: una recarga los olvida y descarta esas lecturas.
 

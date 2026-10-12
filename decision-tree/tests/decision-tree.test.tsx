@@ -617,6 +617,17 @@ test('a closing question is settled when the person answers on their own', async
   await ui.unmount()
 })
 
+test('a slash command typed meanwhile, /decision-tree above all, leaves the question in place', async ($, on) => {
+  const seen = world(on)
+  await complete($, '¿Lo hago con Postgres o con SQLite?')
+  await settle($, () => seen.opened > 0)
+
+  await typed($, '/decision-tree')
+  const ui = await $.ui.mount({ plugin: 'decision-tree', surface: 'terminal', ...PANE })
+  expect(await ui.find({ type: 'Text', text: /Postgres o con SQLite/ })).toBeDefined()
+  await ui.unmount()
+})
+
 test('a question read after the person spoke is dropped', async ($, on) => {
   const seen = world(on)
   const reading = gate()
