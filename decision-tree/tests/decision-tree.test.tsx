@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import type { EngineInterface, On } from 'claude-code'
+import type { AgentInfo, EngineInterface, On } from 'claude-code'
 
 import { composeAnswer, forkMayCall, fromToolQuestions, isReadOnlyShell } from '../hooks/register'
 
@@ -14,7 +14,21 @@ const QUESTION = {
 const PANE = { component: 'Pane', props: { title: 'Decisión' }, requestId: 'decision-tree' } as const
 
 function world(on: On) {
-  const seen = { spawns: [] as string[], submits: [] as string[], completes: 0, opened: 0 }
+  const seen = {
+    spawns: [] as string[],
+    submits: [] as string[],
+    completes: 0,
+    opened: 0,
+    /** What `$.agent.list()` answers. */
+    agents: [] as AgentInfo[],
+    isListFailing: false,
+    /** Holds a spawn until it resolves, as a slow start does. */
+    spawnGate: Promise.resolve(),
+  }
+  on('agent.list', () => {
+    if (seen.isListFailing) throw new Error('agent.list failed')
+    return { value: seen.agents } as never
+  })
   on('turn.complete', (_$, e) => ({ text: e.answer }))
   on('ui.status', () => ({ value: undefined }) as never)
   on('model.complete', () => {
@@ -26,8 +40,9 @@ function world(on: On) {
     seen.opened += 1
     return { value: { isPlaced: true } } as never
   })
-  on('agent.spawn', (_$, e) => {
+  on('agent.spawn', async (_$, e) => {
     seen.spawns.push(e.prompt)
+    await seen.spawnGate
     return { model: 'test', agentId: 'fork-1' }
   })
   on('prompt.submit', (_$, e) => {
@@ -101,10 +116,8 @@ test('trying an option spawns a fork with its reply; confirming sends it', async
   expect(await ui.find({ type: 'Markdown', text: /La rama no arrancó/ })).toBeDefined()
 
   // Outside a fork this plugin started, the guard lets every call through.
-  const mainWrite = await $.tool.call({ tool: 'Write', tool_use_id: 'w1', file_path: '/x', content: 'y' } as never)
-  expect(mainWrite.isError).toBeFalsy()
-  const otherWrite = await $.tool.call({ tool: 'Write', tool_use_id: 'w2', agentId: 'other', file_path: '/x', content: 'y' } as never)
-  expect(otherWrite.isError).toBeFalsy()
+  expect(await call($, { tool: 'Write', file_path: '/x', content: 'y' })).toBe(null)
+  expect(await call($, { tool: 'Write', agentId: 'other', file_path: '/x', content: 'y' })).toBe(null)
 
   await ui.press({ key: 'send' })
   expect(seen.submits).toContain('Usa SQLite.')
@@ -278,6 +291,108 @@ test('what a fork may call', () => {
   // A fork may read secrets (.env); a URL would carry them out.
   expect(forkMayCall('WebFetch', {})).toBe(false)
   expect(forkMayCall('WebSearch', {})).toBe(false)
+})
+
+const FORK_IDS = { plugin: 'decision-tree', key: 'forkIds' } as const
+
+function agent(id: string, spawnedBy?: string): AgentInfo {
+  return { id, description: 'Rama: x', type: 'fork', status: 'running', ...(spawnedBy === undefined ? {} : { spawnedBy }) }
+}
+
+/** Runs a tool call as the engine would; resolves the deny reason, or null when the call went through. */
+async function call($: EngineInterface, input: Record<string, unknown>): Promise<string | null> {
+  const r = (await $.tool.call({ tool_use_id: `t-${Math.random()}`, ...input } as never)) as { deny?: string; text?: string }
+  if (typeof r.deny === 'string') return r.deny
+  expect(r.text, JSON.stringify(r)).toBe('ok')
+  return null
+}
+
+const WRITE = { tool: 'Write', file_path: '/x', content: 'y' }
+
+test('the guard holds a fork this plugin started', async ($, on) => {
+  const seen = world(on)
+  // The kit drops an agentId a test spawn makes up and answers state reads
+  // itself, so the fork's id reaches forkIds the other way the guard learns
+  // it: the agent list naming this plugin as the one that spawned it.
+  const written: unknown[] = []
+  on('state.set', (_$, e, next) => {
+    if (e.plugin === FORK_IDS.plugin && e.key === FORK_IDS.key) written.push(e.value)
+    return next(e)
+  })
+  seen.agents = [agent('fork-9', 'decision-tree')]
+  expect(await call($, { ...WRITE, agentId: 'fork-9' })).toContain('rama de prueba')
+  expect(written.at(-1)).toEqual(['fork-9'])
+
+  // Gone from the list (a finished agent leaves it), the id in forkIds still holds it.
+  seen.agents = []
+  expect(await call($, { tool: 'Edit', agentId: 'fork-9', file_path: '/x', old_string: 'a', new_string: 'b' })).not.toBe(null)
+  expect(await call($, { tool: 'Bash', agentId: 'fork-9', command: 'rm -rf build' })).not.toBe(null)
+  expect(await call($, { tool: 'Bash', agentId: 'fork-9', command: "find . '-delete'" })).not.toBe(null)
+  expect(await call($, { tool: 'WebFetch', agentId: 'fork-9', url: 'https://example.com', prompt: 'x' })).not.toBe(null)
+
+  expect(await call($, { tool: 'Bash', agentId: 'fork-9', command: 'ls -la' })).toBe(null)
+  expect(await call($, { tool: 'Read', agentId: 'fork-9', file_path: '/x' })).toBe(null)
+  // The main loop and other subagents keep every tool.
+  expect(await call($, WRITE)).toBe(null)
+  expect(await call($, { ...WRITE, agentId: 'other' })).toBe(null)
+})
+
+test('the guard holds a fork whose spawn has not resolved yet', async ($, on) => {
+  const seen = world(on)
+  await complete($, '¿Lo hago con Postgres o con SQLite?')
+  await settle($, () => seen.opened > 0)
+
+  let release = () => {}
+  seen.spawnGate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  const ui = await $.ui.mount({ plugin: 'decision-tree', surface: 'terminal', ...PANE })
+  const pressing = ui.press({ key: 'try' })
+  await settle($, () => seen.spawns.length > 0)
+
+  // The fork runs before its id comes back: not listed yet, or listed as ours.
+  expect(await call($, { ...WRITE, agentId: 'fork-new' })).not.toBe(null)
+  seen.agents = [agent('fork-new', 'decision-tree'), agent('model-sub'), agent('other-plugin-sub', 'someone-else')]
+  expect(await call($, { tool: 'Bash', agentId: 'fork-new', command: 'rm -rf build' })).not.toBe(null)
+
+  // Subagents someone else started keep every tool meanwhile.
+  expect(await call($, { ...WRITE, agentId: 'model-sub' })).toBe(null)
+  expect(await call($, { ...WRITE, agentId: 'other-plugin-sub' })).toBe(null)
+
+  release()
+  await pressing
+  await ui.unmount()
+})
+
+test("the guard holds any fork listed as this plugin's, however old", async ($, on) => {
+  const seen = world(on)
+  seen.agents = [agent('old-fork', 'decision-tree')]
+  expect(await call($, { ...WRITE, agentId: 'old-fork' })).not.toBe(null)
+
+  // With no spawn under way, an agent nobody lists is not this plugin's.
+  expect(await call($, { ...WRITE, agentId: 'workflow-agent' })).toBe(null)
+})
+
+test('when the guard cannot look an agent up, it refuses only while a fork may be starting', async ($, on) => {
+  const seen = world(on)
+  seen.isListFailing = true
+  // No spawn under way: another plugin's or the model's subagent keeps working.
+  expect(await call($, { ...WRITE, agentId: 'model-sub' })).toBe(null)
+
+  await complete($, '¿Lo hago con Postgres o con SQLite?')
+  await settle($, () => seen.opened > 0)
+  let release = () => {}
+  seen.spawnGate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  const ui = await $.ui.mount({ plugin: 'decision-tree', surface: 'terminal', ...PANE })
+  const pressing = ui.press({ key: 'try' })
+  await settle($, () => seen.spawns.length > 0)
+  expect(await call($, { ...WRITE, agentId: 'maybe-the-fork' })).not.toBe(null)
+
+  release()
+  await pressing
+  await ui.unmount()
 })
 
 test('a custom answer joins the options and gets analysed', async ($, on) => {

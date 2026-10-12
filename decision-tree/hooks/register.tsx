@@ -18,9 +18,16 @@ const focus = atom({ plugin: 'decision-tree', key: 'focus' } as const, 0)
 const picks = atom({ plugin: 'decision-tree', key: 'picks' } as const, {})
 const implications = atom({ plugin: 'decision-tree', key: 'implications' } as const, {})
 const forks = atom({ plugin: 'decision-tree', key: 'forks' } as const, {})
-// Every fork this plugin started, never reset, so the guard below keeps
-// holding a fork that outlives the ask it was started for.
+// Every fork this plugin started, never reset nor capped, so the guard below
+// keeps holding a fork that outlives the ask it was started for.
 const forkIds = atom({ plugin: 'decision-tree', key: 'forkIds' } as const, [])
+
+// The guard's own memory, for its .catch, which may not call $: the forks it
+// knows, the agents listed as someone else's, and the spawns under way, whose
+// forks can call tools before $.agent.spawn hands back their id.
+const knownForks = new Set<string>()
+const foreignAgents = new Set<string>()
+let pendingSpawns = 0
 
 // What the last drawing said about the layout; unknown until the pane draws.
 let isFullscreen: boolean | undefined
@@ -555,6 +562,33 @@ async function imply($: EngineInterface, id: string, qi: number, oi: number) {
   await update($, implications, all => ({ ...all, [slot]: result }))
 }
 
+async function rememberFork($: EngineInterface, agentId: string) {
+  knownForks.add(agentId)
+  await update($, forkIds, ids => (ids.includes(agentId) ? ids : [...ids, agentId]))
+}
+
+/** Whether the agent is a fork this plugin started, its id handed back yet or not. */
+async function isOwnFork($: EngineInterface, agentId: string): Promise<boolean> {
+  if (knownForks.has(agentId)) return true
+  if (foreignAgents.has(agentId)) return false
+  if ((await read($, forkIds)).includes(agentId)) {
+    knownForks.add(agentId)
+    return true
+  }
+  const listed = (await $.agent.list()).find(one => one.id === agentId)
+  if (listed?.spawnedBy === 'decision-tree') {
+    await rememberFork($, agentId)
+    return true
+  }
+  if (listed !== undefined) {
+    foreignAgents.add(agentId)
+    return false
+  }
+  // Listed by nobody yet: while a spawn of this plugin is under way, it may
+  // be that fork. Not remembered either way; the next call asks again.
+  return pendingSpawns > 0
+}
+
 async function branch($: EngineInterface, id: string, qi: number, oi: number) {
   const a = await current($, id)
   const q = a?.questions[qi]
@@ -566,6 +600,8 @@ async function branch($: EngineInterface, id: string, qi: number, oi: number) {
 
   const setFork = (fork: DecisionFork) => update($, forks, all => ({ ...all, [slot]: fork }))
   await setFork({ status: 'starting', text: '' })
+  // Held until the id is remembered: the fork may call tools before then.
+  pendingSpawns += 1
   try {
     const spawned = await $.agent.spawn({
       subagentType: 'fork',
@@ -577,10 +613,12 @@ async function branch($: EngineInterface, id: string, qi: number, oi: number) {
       return
     }
     const agentId = spawned.agentId
-    await update($, forkIds, ids => [...ids, agentId].slice(-100))
+    await rememberFork($, agentId)
     await setFork({ status: 'running', agentId, text: '' })
   } catch (error) {
     await setFork({ status: 'error', text: `La rama no arrancó: ${String(error)}` })
+  } finally {
+    pendingSpawns -= 1
   }
 }
 
@@ -674,21 +712,29 @@ export const register: Register = on => {
     return next(e)
   })
 
+  const forkDeny = (tool: string) => ({
+    deny: `decision-tree: esta es una rama de prueba; ${tool} no está permitido aquí. Describe el cambio en tu informe en lugar de aplicarlo.`,
+  })
+
   on('tool.call', async ($, e, next) => {
     if (e.agentId === undefined) return next(e)
-    if (!(await read($, forkIds)).includes(e.agentId)) return next(e)
+    if (!(await isOwnFork($, e.agentId))) return next(e)
 
     const tool = String(e.tool)
     if (forkMayCall(tool, { command: 'command' in e ? e.command : undefined })) return next(e)
-
-    return {
-      deny: `decision-tree: esta es una rama de prueba; ${tool} no está permitido aquí. Describe el cambio en tu informe en lugar de aplicarlo.`,
+    return forkDeny(tool)
+  }).catch(($, e, next) => {
+    // Judged from what this module holds: $ may not answer here.
+    if (next.called || e.agentId === undefined || foreignAgents.has(e.agentId)) return next(e)
+    const tool = String(e.tool)
+    if (knownForks.has(e.agentId)) {
+      return forkMayCall(tool, { command: 'command' in e ? e.command : undefined }) ? next(e) : forkDeny(tool)
     }
-  }).catch(($, e, next) =>
-    next.called || e.agentId === undefined
-      ? next(e)
-      : { deny: 'decision-tree: no se pudo comprobar si esta llamada viene de una rama de prueba.' },
-  )
+    if (pendingSpawns > 0) {
+      return { deny: 'decision-tree: no se pudo comprobar si esta llamada viene de una rama de prueba.' }
+    }
+    return next(e)
+  })
 
   // The handed-off dialog's transcript row: a card pointing to the panel in
   // place of the refusal text the model reads.
