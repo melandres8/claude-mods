@@ -525,9 +525,14 @@ async function present($: EngineInterface, next: DecisionAsk, isAsked: boolean) 
   return isPlaced
 }
 
+// The main turn that ended last; undefined once the person spoke after it. A
+// question read for any other turn is stale and dropped.
+let latestTurn: string | undefined
+
 async function readQuestion($: EngineInterface, answer: string, turnId: string) {
   await update($, phase, () => 'reading')
   const reply = await $.model.complete({ model: 'haiku', prompt: ASK_PROMPT(answer), maxTokens: 800 })
+  if (latestTurn !== turnId) return
   const found = reply.isAnswered ? parseQuestion(reply.text) : null
 
   if (found === null) {
@@ -718,12 +723,18 @@ export const register: Register = on => {
       return next(e)
     }
 
+    // Any reading still under way is for an older turn now.
+    latestTurn = e.turnId
+
     // An AskUserQuestion handed to the panel stays until it is answered.
     const pending = await read($, ask)
     if (pending?.source === 'tool') return next(e)
 
     if (e.reason === 'answer' && endsWithQuestion(e.answer)) {
-      void readQuestion($, e.answer, e.turnId).catch(() => update($, phase, () => 'none'))
+      const turnId = e.turnId
+      void readQuestion($, e.answer, turnId).catch(() =>
+        latestTurn === turnId ? update($, phase, () => 'none') : undefined,
+      )
     }
     return next(e)
   })
@@ -738,9 +749,13 @@ export const register: Register = on => {
       }
       return next(e)
     }
-    // The person answered on their own: a dialog handed to the panel is settled.
-    if (e.origin === undefined || e.origin.kind === 'composer') {
-      if ((await read($, ask))?.source === 'tool') await settle($)
+    // The person answered on their own (at the prompt, from the phone or as
+    // the SDK host): whatever question the panel holds is settled, and one
+    // still being read is dropped.
+    const kind = e.origin?.kind
+    if (kind === undefined || kind === 'composer' || kind === 'bridge' || kind === 'sdk') {
+      latestTurn = undefined
+      if ((await read($, ask)) !== null || (await read($, phase)) === 'reading') await settle($)
     }
     return next(e)
   })

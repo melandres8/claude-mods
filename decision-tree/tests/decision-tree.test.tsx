@@ -11,6 +11,14 @@ const QUESTION = {
   ],
 }
 
+const REDIS_QUESTION = {
+  question: '¿Añado una caché con Redis?',
+  options: [
+    { label: 'Sí', reply: 'Sí, añade Redis.' },
+    { label: 'No', reply: 'No hace falta.' },
+  ],
+}
+
 const PANE = { component: 'Pane', props: { title: 'Decisión' }, requestId: 'decision-tree' } as const
 
 function world(on: On) {
@@ -30,6 +38,8 @@ function world(on: On) {
     isForkFailing: false,
     /** Whether `$.ui.open` places the pane. */
     isPlaced: true,
+    /** Each reading of a question waits on the next of these, when there is one. */
+    completeGates: [] as Promise<void>[],
   }
   on('agent.list', () => {
     if (seen.isListFailing) throw new Error('agent.list failed')
@@ -37,9 +47,11 @@ function world(on: On) {
   })
   on('turn.complete', (_$, e) => ({ text: e.answer }))
   on('ui.status', () => ({ value: undefined }) as never)
-  on('model.complete', () => {
+  on('model.complete', async (_$, e) => {
     seen.completes += 1
-    return { value: { isAnswered: true, text: JSON.stringify(QUESTION), usage: usage() } } as never
+    await (seen.completeGates.shift() ?? Promise.resolve())
+    const question = e.prompt.includes('Redis') ? REDIS_QUESTION : QUESTION
+    return { value: { isAnswered: true, text: JSON.stringify(question), usage: usage() } } as never
   })
   on('model.fork', async () => {
     seen.forkCalls += 1
@@ -575,4 +587,53 @@ test('a dialog the pane cannot take keeps the native dialog and analyses nothing
   expect('deny' in asked && asked.deny !== undefined).toBe(false)
   await pause(20)
   expect(seen.forkCalls).toBe(0)
+})
+
+function typed($: EngineInterface, text: string) {
+  return $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } } as never)
+}
+
+test('a closing question is settled when the person answers on their own', async ($, on) => {
+  const seen = world(on)
+  await complete($, '¿Lo hago con Postgres o con SQLite?')
+  await settle($, () => seen.opened > 0)
+
+  await typed($, 'Ninguna, usa DuckDB.')
+  const ui = await $.ui.mount({ plugin: 'decision-tree', surface: 'terminal', ...PANE })
+  expect(await ui.find({ type: 'Text', text: /Sin pregunta pendiente/ })).toBeDefined()
+  expect(await ui.find({ key: 'send' })).toBe(undefined)
+  await ui.unmount()
+})
+
+test('a question read after the person spoke is dropped', async ($, on) => {
+  const seen = world(on)
+  const reading = gate()
+  seen.completeGates.push(reading.held)
+  await complete($, '¿Lo hago con Postgres o con SQLite?')
+  await settle($, () => seen.completes === 1)
+
+  await typed($, 'Olvídalo, sigue con lo otro.')
+  reading.release()
+  await pause(20)
+  expect(seen.opened).toBe(0)
+  const ui = await $.ui.mount({ plugin: 'decision-tree', surface: 'terminal', ...PANE })
+  expect(await ui.find({ key: 'send' })).toBe(undefined)
+  await ui.unmount()
+})
+
+test('a slow reading of an older turn does not replace the newer question', async ($, on) => {
+  const seen = world(on)
+  const slow = gate()
+  seen.completeGates.push(slow.held)
+  await complete($, 'Antes de seguir: ¿añado una caché con Redis?')
+  await settle($, () => seen.completes === 1)
+  await complete($, '¿Lo hago con Postgres o con SQLite?')
+  await settle($, () => seen.opened > 0)
+
+  slow.release()
+  await pause(20)
+  const ui = await $.ui.mount({ plugin: 'decision-tree', surface: 'terminal', ...PANE })
+  expect(await ui.find({ type: 'Text', text: /Postgres o con SQLite/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Redis/ })).toBe(undefined)
+  await ui.unmount()
 })
