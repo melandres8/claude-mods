@@ -77,7 +77,8 @@ test('extracts the last handoff block', () => {
     from: 'builder',
     body: 'informe',
   })
-  expect(parseHeader('Mensaje de otra sesión:\n[relevo ronda 2 · de planner] paso')?.round).toBe(2)
+  // Anchored: a header quoted after other text is not one.
+  expect(parseHeader('Mensaje de otra sesión:\n[relevo ronda 2 · de planner] paso')).toBe(null)
   expect(sameText('a\n  b', 'a b')).toBe(true)
   expect(stripHeader('[relevo ronda 2 · de builder]\n\n\ninforme')).toBe('informe')
   expect(stripHeader('informe que cita [relevo ronda 2 · de builder]')).toBe('informe que cita [relevo ronda 2 · de builder]')
@@ -381,7 +382,11 @@ test('two sessions with one name are offered as name [ref]', async ($, on) => {
 
 test('link messages parse and stay out of the round header', () => {
   expect(parseLink(linkAsk('planner', 'aaa-id'))).toEqual({ kind: 'ask', from: 'planner', id: 'aaa-id' })
-  expect(parseLink(`envelope\n${linkOk('builder')}`)).toEqual({ kind: 'ok', from: 'builder' })
+  expect(parseLink(linkOk('builder'))).toEqual({ kind: 'ok', from: 'builder' })
+  // Only a message that is exactly a link line is one.
+  expect(parseLink(`envelope\n${linkOk('builder')}`)).toBe(null)
+  expect(parseLink(`${linkOk('builder')} y más texto`)).toBe(null)
+  expect(parseLink(`informe que cita ${linkAsk('planner', 'X')}`)).toBe(null)
   expect(parseLink(linkNo('ocupada como planner con X'))).toEqual({ kind: 'no', reason: 'ocupada como planner con X' })
   expect(parseLink('[relevo ronda 1 · de planner]\n\npaso')).toBe(null)
   expect(parseHeader(linkAsk('planner', 'aaa-id'))).toBe(null)
@@ -450,6 +455,19 @@ test('a busy session refuses the link and keeps its role', async ($, on) => {
   expect((await command($, 'status')).text).toContain('planner ⇄ C')
   expect(parseLink(sent[0]?.text ?? '')?.kind).toBe('no')
   expect(toasts.at(-1)).toContain('pidió enlazar')
+})
+
+test('a handoff that quotes a link line is a handoff, not a link', async ($, on) => {
+  const sent = relay(on)
+  await command($, 'builder A')
+  const incoming = `[relevo ronda 2 · de planner]\n\nCita del protocolo: ${linkAsk('planner', 'X-id')}`
+  const passed = await $.session.receive({ origin: { kind: 'peer' }, text: incoming })
+
+  expect(passed.consumed).toBeUndefined()
+  expect(passed.text).toContain('Cita del protocolo')
+  expect((await command($, 'status')).text).toContain('builder ⇄ A')
+  expect((await command($, 'status')).text).toContain('ronda 2/')
+  expect(sent.length).toBe(0)
 })
 
 test('the pane shows each way’s last handoff once a role is set', async ($, on) => {

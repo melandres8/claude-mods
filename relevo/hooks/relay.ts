@@ -1,6 +1,8 @@
 import type { RelevoRole } from '../types'
 
-const HEADER = /\[relevo ronda (\d+) · de (planner|builder)\]\s*/
+// Anchored: a delivery's text is its body as the model reads it, with no
+// envelope before it, so a header is one only at the very start.
+const HEADER = /^\s*\[relevo ronda (\d+) · de (planner|builder)\]\s*/
 
 // The last whole block: the last closing tag, and the last opening before it.
 // A tag quoted in code (`<handoff>` in prose, a fenced example) is not one:
@@ -28,15 +30,12 @@ export function header(round: number, from: RelevoRole): string {
 export function stripHeader(body: string): string {
   const match = HEADER.exec(body)
 
-  return match !== null && body.slice(0, match.index).trim() === ''
-    ? body.slice(match.index + match[0].length).trim()
-    : body
+  return match === null ? body : body.slice(match[0].length).trim()
 }
 
 export function parseHeader(
   text: string,
 ): { round: number; from: RelevoRole; body: string } | null {
-  // Not anchored: the engine may wrap a delivery in an envelope of its own.
   const match = HEADER.exec(text)
   if (match === null) {
     return null
@@ -45,7 +44,7 @@ export function parseHeader(
   return {
     round: Number(match[1]),
     from: match[2] as RelevoRole,
-    body: text.slice(match.index + match[0].length).trim(),
+    body: text.slice(match[0].length).trim(),
   }
 }
 
@@ -86,10 +85,12 @@ export type LinkMessage =
   | { kind: 'ok'; from: RelevoRole }
   | { kind: 'no'; reason: string }
 
-const LINK = /\[relevo enlace(?:-(ok|no))? · ([^\]\n]+)\]/
+// Anchored at both ends: a message is a link message only when its whole
+// text is one link line, so a handoff that quotes one stays a handoff.
+const LINK = /^\s*\[relevo enlace(?:-(ok|no))? · ([^\]\n]+)\]\s*$/
 
 export function linkAsk(from: RelevoRole, id: string): string {
-  return `[relevo enlace · ${from} ${id}]\nrelevo configura esta sesión como ${from === 'planner' ? 'builder' : 'planner'}.`
+  return `[relevo enlace · ${from} ${id}]`
 }
 
 export function linkOk(from: RelevoRole): string {
@@ -101,7 +102,6 @@ export function linkNo(reason: string): string {
 }
 
 export function parseLink(text: string): LinkMessage | null {
-  // Not anchored, as parseHeader: the engine may wrap it in an envelope.
   const match = LINK.exec(text)
   if (match === null) {
     return null
