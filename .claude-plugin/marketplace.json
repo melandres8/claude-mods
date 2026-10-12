@@ -1,0 +1,17 @@
+{
+  "name": "claude-mods",
+  "description": "Claude Code mods by Melkin Mosquera.",
+  "owner": {
+    "name": "Melkin Mosquera"
+  },
+  "plugins": [
+    {
+      "name": "relevo",
+      "source": "./relevo"
+    },
+    {
+      "name": "decision-tree",
+      "source": "./decision-tree"
+    }
+  ]
+}

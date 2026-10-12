@@ -1,0 +1,5 @@
+node_modules/
+test-results/
+.DS_Store
+# Local sandbox projects used to try the mods; not part of the repo.
+crud/

@@ -1,0 +1,7 @@
+{
+  "name": "decision-tree",
+  "version": "0.2.0",
+  "description": "Turns Claude's closing question, or its AskUserQuestion call, into a side panel: each option with what it implies, and a real forked session to try any answer before confirming it.",
+  "author": { "name": "Melkin Mosquera" },
+  "types": "./types/index.d.ts"
+}

@@ -1,0 +1,17 @@
+{
+  "name": "relevo",
+  "version": "0.1.0",
+  "description": "Relay between two local sessions: one plans, the other builds, and they hand work back and forth on their own.",
+  "author": {
+    "name": "Melkin Mosquera"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "maxRounds": {
+      "type": "number",
+      "title": "Max rounds",
+      "description": "Rounds the planner may send before relevo pauses itself.",
+      "default": 10
+    }
+  }
+}
