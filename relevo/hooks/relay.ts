@@ -3,7 +3,39 @@ import type { RelevoRole } from '../types'
 // Anchored: a delivery's text is its body as the model reads it, with no
 // envelope before it, so a header is one only at the very start. On the wire
 // it carries the link's nonce; the model reads it, and may copy it, without.
-const HEADER = /^\s*\[relevo ronda (\d+) · de (planner|builder)(?: · ([\w-]+))?\]\s*/
+const HEADER = /^\s*\[relevo ronda (\d+) · de ([a-z][a-z0-9_-]{0,31})(?: · ([\w-]+))?\]\s*/
+
+// A worker's role is its name: herdr's agent-name rule, so the same word
+// names the herdr pane, the Claude session and the <handoff to="…"> target.
+const NAME = /^[a-z][a-z0-9_-]{0,31}$/
+const RESERVED = new Set(['planner', 'goal', 'pause', 'resume', 'status', 'off', 'join'])
+
+// Trust boundary: a worker name comes from model output and ends up in a
+// shell command, so only this shape ever passes.
+export function isWorkerName(name: string): boolean {
+  return NAME.test(name) && !RESERVED.has(name)
+}
+
+// Every whole <handoff> block, each with its `to` (null when it names none).
+// Same masking as extractTag; for each closing tag, the last opening before
+// it and after the previous block counts, so an unclosed mention is skipped.
+export function extractHandoffs(text: string): { to: string | null; body: string }[] {
+  const blank = (code: string) => ' '.repeat(code.length)
+  const masked = text.replace(/```[\s\S]*?```/g, blank).replace(/`[^`\n]*`/g, blank)
+  const found: { to: string | null; body: string }[] = []
+  let from = 0
+  for (let close = masked.indexOf('</handoff>', from); close !== -1; close = masked.indexOf('</handoff>', from)) {
+    const window = masked.slice(from, close)
+    const open = /<handoff(?:\s+to="([^"]*)")?\s*>(?![\s\S]*<handoff[\s>])/.exec(window)
+    if (open !== null) {
+      const body = text.slice(from + open.index + open[0].length, close).trim()
+      if (body !== '') found.push({ to: open[1] ?? null, body })
+    }
+    from = close + '</handoff>'.length
+  }
+
+  return found
+}
 
 // The last whole block: the last closing tag, and the last opening before it.
 // A tag quoted in code (`<handoff>` in prose, a fenced example) is not one:
@@ -20,6 +52,17 @@ export function extractTag(text: string, tag: 'handoff' | 'done'): string | null
   const body = text.slice(start + open.length, close).trim()
 
   return body === '' ? null : body
+}
+
+// The body of a delivery wrapped as one whole <cross-session-message …>
+// envelope; any other text as it is. Only the envelope's own tags at both
+// ends come off, so a header or link line stays anchored to the body's start.
+const ENVELOPE = /^\s*<cross-session-message\b[^>]*>\r?\n?([\s\S]*?)\r?\n?<\/cross-session-message>\s*$/
+
+export function unwrap(text: string): string {
+  const match = ENVELOPE.exec(text)
+
+  return match === null ? text : (match[1] ?? '')
 }
 
 export function header(round: number, from: RelevoRole, nonce?: string): string {
@@ -94,8 +137,8 @@ export type LinkMessage =
 
 // Anchored at both ends: a message is a link message only when its whole
 // text is one link line, so a handoff that quotes one stays a handoff.
-const LINK_ASK = /^\s*\[relevo enlace · (planner|builder) (\S+) ([\w-]+)\]\s*$/
-const LINK_OK = /^\s*\[relevo enlace-ok · (planner|builder) ([\w-]+)\]\s*$/
+const LINK_ASK = /^\s*\[relevo enlace · ([a-z][a-z0-9_-]{0,31}) (\S+) ([\w-]+)\]\s*$/
+const LINK_OK = /^\s*\[relevo enlace-ok · ([a-z][a-z0-9_-]{0,31}) ([\w-]+)\]\s*$/
 
 export function linkAsk(from: RelevoRole, id: string, nonce: string): string {
   return `[relevo enlace · ${from} ${id} ${nonce}]`
