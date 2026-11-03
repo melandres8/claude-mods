@@ -1,7 +1,7 @@
 {
   "name": "relevo",
-  "version": "0.2.0",
-  "description": "Relay between two local sessions: one plans, the other builds, and they hand work back and forth on their own.",
+  "version": "0.3.0",
+  "description": "Relay between local sessions: one plans, named workers (builder, researcher, reviewer...) build, research or review, and they hand work back and forth on their own. In herdr the planner starts its workers itself.",
   "author": {
     "name": "Melkin Mosquera"
   },
@@ -12,6 +12,12 @@
       "title": "Max rounds",
       "description": "Rounds the planner may send before relevo pauses itself.",
       "default": 10
+    },
+    "maxWorkers": {
+      "type": "number",
+      "title": "Max workers",
+      "description": "Workers a planner may link or start in herdr.",
+      "default": 3
     }
   }
 }
