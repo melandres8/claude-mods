@@ -603,7 +603,11 @@ async function setRole($: $, verb: RelevoRole, to: string): Promise<string> {
       return `enlazada con ${target}; worker ${accepting.from} añadido.`
     }
 
-    return `ya enlazada con ${Object.values(all).map(one => one.peer).join(', ')}; /relevo off para cambiar.`
+    const linked = Object.values(all).filter(one => one.link === 'linked').map(one => one.peer)
+    const waiting = Object.entries(all).filter(([, one]) => one.link === 'waiting').map(([name]) => name)
+    const still = waiting.length === 0 ? '' : ` Sin enlace aún: ${waiting.join(', ')} (/relevo status).`
+
+    return `ya enlazada con ${linked.join(', ')}; /relevo off para cambiar.${still}`
   }
   await update($, role, () => verb)
   await update($, links, () => ({}))
@@ -622,8 +626,11 @@ async function setRole($: $, verb: RelevoRole, to: string): Promise<string> {
 
   const fresh = crypto.randomUUID()
   const manual = `/relevo ${acceptVerb(verb)} ${self}`
+  // Stored before the ask goes out: a planner that started this worker
+  // answers at once, and its ok must find the nonce waiting here.
+  await setLink($, key, blankLink(target, { nonce: fresh, link: 'waiting' }))
   const sent = await sendQuiet($, target, linkAsk(verb, self, fresh))
-  await setLink($, key, blankLink(target, { nonce: fresh, link: sent ? 'waiting' : 'none' }))
+  if (!sent) await setLink($, key, { link: 'none' })
 
   return sent
     ? `esta sesión es ${verb.toUpperCase()} ⇄ ${target}. Enlace enviado; acéptalo en ${target} con: ${manual}`
@@ -824,8 +831,14 @@ async function answerLink($: $, opts: Opts, text: string): Promise<void> {
     }
     const made = current === 'planner' && message.from !== 'planner' ? all[message.from] : undefined
     if (made !== undefined && made.spawned && made.link === 'waiting' && made.peer === message.id) {
+      // Unacked, the worker would wait forever: stay waiting, so the 90 s
+      // check still points at it.
+      if (!(await sendQuiet($, made.peer, linkOk('planner', message.nonce)))) {
+        $.ui.toast(`relevo: no se pudo confirmar el enlace con ${message.from}; sigue esperando.`)
+
+        return
+      }
       await setLink($, message.from, { nonce: message.nonce, link: 'linked' })
-      await sendQuiet($, made.peer, linkOk('planner', message.nonce))
       $.ui.toast(`relevo: ${message.from} enlazado.`)
       await flush($, opts, message.from)
 
