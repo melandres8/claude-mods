@@ -226,6 +226,7 @@ node <pstack>/skills/statechart/scripts/statechart.mjs from-spec docs/model/Rele
   --expect-broken NeverFinishesInParallel --cover --png \
   --title "relevo: planificadora y workers en paralelo"
 python3 docs/make-hero.py docs/relevo-hub.svg
+python3 docs/make-hero.py docs/relevo-hub.en.svg en
 ```
 
 ## Desarrollo
