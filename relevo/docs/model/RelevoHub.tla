@@ -88,7 +88,8 @@ Crash(w) ==
   /\ worker' = [worker EXCEPT ![w] = "crashed"]
   /\ UNCHANGED <<planner, round, held, together>>
 
-\* The 90 s watchdog, or the person's /relevo resume, gives up on the
+\* The person's /relevo resume, or the 90 s watchdog for a worker that
+\* never joined (one that dies while busy has no watchdog), gives up on the
 \* workers that never answered and hands the held reports over
 \* (resumeRelay): a dead worker can be started again next round.
 Resume ==

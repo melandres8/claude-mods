@@ -1128,3 +1128,59 @@ test('a stuck worker’s peers’ reports are handed over by resume', async ($, 
   const next = await $.session.receive({ origin: FROM_RELEVO, text: `${header(2, 'builder', nonce)}\n\nhecho 2` })
   expect(next.text).toBe('[relevo ronda 2 · de builder]\n\nhecho 2')
 })
+
+test('a planner that answers before the ask’s send returns still links the worker', async ($, on) => {
+  const toasts: string[] = []
+  engine(on, toasts)
+  on('turn.complete', ($, e) => ({ text: e.answer }))
+  on('session.receive', ($, e) => ({ text: e.text }))
+  const passed: string[] = []
+  on('session.send', async (_, e) => {
+    const ask = parseLink(e.text)
+    // The spawning planner auto-links at once: its ok and the held round
+    // land here before this send has returned.
+    if (ask !== null && ask.kind === 'ask') {
+      await $.session.receive({ origin: FROM_RELEVO, text: linkOk('planner', ask.nonce) })
+      const round = await $.session.receive({ origin: FROM_RELEVO, text: `${header(3, 'planner', ask.nonce)}\n\nrevisa` })
+      if (round.text !== undefined) passed.push(round.text)
+    }
+
+    return { isDelivered: true }
+  })
+  await command($, 'join reviewer P')
+  await clock?.settle()
+
+  expect(passed).toEqual(['[relevo ronda 3 · de planner]\n\nrevisa'])
+  expect((await command($, 'status')).text).toContain('enlazadas')
+})
+
+test('a started worker whose ok cannot be delivered stays waiting and still stalls', async ($, on) => {
+  const toasts: string[] = []
+  engine(on, toasts)
+  on('turn.complete', ($, e) => ({ text: e.answer }))
+  on('session.receive', ($, e) => ({ text: e.text }))
+  on('session.send', () => ({ isDelivered: false, reason: 'sin socket' }))
+  const scripts = herdr(on)
+  await command($, 'planner')
+  await turn($, '<handoff to="reviewer">revisa</handoff>')
+  await clock?.settle()
+  await $.session.receive({ origin: FROM_RELEVO, text: linkAsk('reviewer', idIn(scripts[0]), 'n-v') })
+
+  expect(toasts.at(-1)).toContain('no se pudo confirmar el enlace con reviewer')
+  expect((await command($, 'status')).text).toContain('reviewer: ' + idIn(scripts[0]) + ' · enlace enviado')
+  await clock?.advance(90_000)
+  await clock?.settle()
+  expect(toasts.at(-1)).toContain('hc read reviewer')
+})
+
+test('"ya enlazada" names a waiting worker apart from the linked ones', async ($, on) => {
+  relay(on)
+  const scripts = herdr(on)
+  await linkAs($, 'planner', 'B')
+  await turn($, '<handoff to="reviewer">revisa</handoff>')
+  await clock?.settle()
+
+  const text = (await command($, `planner ${idIn(scripts[0])}`)).text
+  expect(text).toContain('ya enlazada con B;')
+  expect(text).toContain('Sin enlace aún: reviewer')
+})
