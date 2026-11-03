@@ -99,7 +99,7 @@ stateDiagram-v2
 4. **Informes.** Cada worker cierra con su `<handoff>`, que vuelve con la cabecera `[relevo ronda N · de <nombre>]`. Mientras otro worker siga trabajando o arrancando, el informe queda retenido. El último trae todos en un turno.
 5. **Fin o siguiente ronda.** La planificadora reparte otra vez, o escribe `<done>`.
 
-Si un worker muere o no llega a enlazarse, a los 90 s relevo se pausa y te dice dónde mirarlo (`hc read <nombre>` o `herdr agent read <nombre>`). `/relevo resume` deja de esperarlo y pasa los informes que ya han llegado. Un worker que nunca se enlazó se vuelve a abrir en la siguiente ronda.
+Si un worker no llega a enlazarse, a los 90 s relevo se pausa y te dice dónde mirarlo (`hc read <nombre>` o `herdr agent read <nombre>`). Si muere ya enlazado, relevo no lo nota, porque un worker vivo puede tardar una hora: `/relevo status` lo sigue mostrando como `trabajando`. En los dos casos, `/relevo resume` deja de esperarlo y pasa los informes que ya han llegado. Un worker que nunca se enlazó se vuelve a abrir en la siguiente ronda.
 
 ## Activarlo
 
